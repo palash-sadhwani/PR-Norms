@@ -1,0 +1,65 @@
+import asyncio
+
+from celery import Celery
+
+from app.core.config import get_settings
+from app.db.session import SessionLocal
+from app.models import Installation, Repository
+from app.services.analysis import analyze_pull_request
+from app.services.auth import installation_token
+from app.services.ingestion import ingest_repository as run_ingestion
+from app.services.phase2 import SentenceTransformerEmbedder
+from app.services.phase2 import mine_repository as run_phase2
+
+celery = Celery(
+    "prnorms",
+    broker=get_settings().redis_url,
+    backend=get_settings().redis_url,
+    broker_connection_timeout=2,
+    broker_connection_retry=False,
+)
+
+
+@celery.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
+def ingest_repository_task(
+    self, repository_id: int, job_id: int, target_pr_number: int | None = None
+):
+    async def run():
+        async with SessionLocal() as db:
+            repository = await db.get(Repository, repository_id)
+            if repository is None:
+                raise ValueError(f"repository {repository_id} not found")
+            installation = await db.get(Installation, repository.installation_id)
+            if installation is None:
+                raise ValueError(f"installation {repository.installation_id} not found")
+            token = await installation_token(installation.github_id)
+            return await run_ingestion(db, job_id, token, target_pr_number)
+
+    asyncio.run(run())
+
+
+ingest_repository = ingest_repository_task
+
+
+@celery.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
+def mine_repository_task(self, repository_id: int, model_name: str | None = None):
+    async def run():
+        async with SessionLocal() as db:
+            return await run_phase2(db, repository_id, model_name=model_name)
+
+    return asyncio.run(run())
+
+
+@celery.task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
+def analyze_pull_request_task(
+    self, pull_request_id: int, model_name: str | None = None
+):
+    async def run():
+        async with SessionLocal() as db:
+            settings = get_settings()
+            embedder = SentenceTransformerEmbedder(
+                model_name or settings.phase2_embedding_model
+            )
+            return await analyze_pull_request(db, pull_request_id, embedder=embedder)
+
+    return asyncio.run(run())
