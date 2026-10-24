@@ -61,6 +61,26 @@ async def test_github_pagination_and_retry(monkeypatch):
     assert calls == 3
 
 
+@pytest.mark.asyncio
+async def test_github_pagination_of_wrapped_lists():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"total_count": 2, "repositories": [{"id": 1}, {"id": 2}]}
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.com", transport=httpx.MockTransport(handler)
+    )
+    async with GitHubClient("token", client) as github:
+        items = [
+            item
+            async for item in github.paginate(
+                "/installation/repositories", items_key="repositories"
+            )
+        ]
+    assert [item["id"] for item in items] == [1, 2]
+
+
 def test_meaningful_feedback_is_not_filtered():
     result = preprocess_comment("LGTM, but move DB access to repository layer")
     assert result.is_low_information is False

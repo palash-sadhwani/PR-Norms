@@ -54,10 +54,14 @@ class GitHubClient:
                 path, params=params, headers=self._headers()
             )
             last_response = response
+            # Secondary rate limits are 403s that carry retry-after.
             rate_limited = response.status_code == 403 and (
                 response.headers.get("x-ratelimit-remaining") == "0"
+                or "retry-after" in response.headers
             )
             if response.status_code in {429, 500, 502, 503, 504} or rate_limited:
+                if attempt == 3:
+                    break
                 retry_after = response.headers.get("retry-after")
                 delay = float(retry_after) if retry_after else 2**attempt
                 await asyncio.sleep(delay)
@@ -74,8 +78,12 @@ class GitHubClient:
                 )
             return response
         if last_response is not None:
-            rate_limited = last_response.status_code == 403 and (
-                last_response.headers.get("x-ratelimit-remaining") == "0"
+            rate_limited = last_response.status_code == 429 or (
+                last_response.status_code == 403
+                and (
+                    last_response.headers.get("x-ratelimit-remaining") == "0"
+                    or "retry-after" in last_response.headers
+                )
             )
             if rate_limited:
                 raise GitHubRequestError(
@@ -111,11 +119,16 @@ class GitHubClient:
             raise RuntimeError(f"GitHub GraphQL error: {payload['errors']}")
         return payload["data"]
 
-    async def paginate(self, path: str, **params) -> AsyncIterator[dict]:
+    async def paginate(
+        self, path: str, *, items_key: str | None = None, **params
+    ) -> AsyncIterator[dict]:
+        """Yield every item of a paged list; items_key names a wrapped list."""
         page = 1
         while True:
             response = await self.get(path, page=page, per_page=100, **params)
             items = response.json()
+            if items_key is not None:
+                items = items.get(items_key, [])
             if not items:
                 return
             for item in items:

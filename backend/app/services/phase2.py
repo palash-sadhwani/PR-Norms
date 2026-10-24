@@ -18,10 +18,17 @@ from app.models import (
     CommentCluster,
     CommentClusterMember,
     CommentEmbedding,
+    NormVersion,
     PullRequest,
     Repository,
     ReviewComment,
 )
+from app.services.norms import ensure_initial_version, record_version
+
+# A new cluster continues a previous one when at least half of the smaller
+# cluster's comments are shared, or when their centroids nearly coincide.
+MATCH_MIN_OVERLAP = 0.5
+MATCH_MIN_CENTROID_SIMILARITY = 0.9
 
 
 class Embedder(Protocol):
@@ -94,6 +101,8 @@ class MiningResult:
     noise: int = 0
     embeddings_reused: int = 0
     embeddings_created: int = 0
+    norms_created: int = 0
+    norms_retired: int = 0
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
@@ -236,43 +245,92 @@ async def mine_repository(
     if len(labels) != len(comments):
         raise ValueError("clusterer returned an unexpected label count")
 
-    old_clusters = list(
+    previous_clusters = list(
         (
             await db.scalars(
                 select(CommentCluster).where(
                     CommentCluster.repository_id == repository_id,
                     CommentCluster.model_name == model_name,
                     CommentCluster.algorithm == "hdbscan",
+                    CommentCluster.active.is_(True),
                 )
             )
         ).all()
     )
-    existing_by_label = {cluster.label: cluster for cluster in old_clusters}
-    for cluster in old_clusters:
+    previous_members: dict[int, set[int]] = {
+        cluster.id: set() for cluster in previous_clusters
+    }
+    if previous_clusters:
+        for cluster_id, comment_id in (
+            await db.execute(
+                select(
+                    CommentClusterMember.cluster_id,
+                    CommentClusterMember.review_comment_id,
+                ).where(CommentClusterMember.cluster_id.in_(previous_members))
+            )
+        ).all():
+            previous_members[cluster_id].add(comment_id)
+        # Clusters recorded without member rows (older data, seeded demos) are
+        # identified by their norm's active evidence instead.
+        unrecorded = [cid for cid, members in previous_members.items() if not members]
+        if unrecorded:
+            for cluster_id, comment_id in (
+                await db.execute(
+                    select(CandidateNorm.cluster_id, CandidateNormEvidence.review_comment_id)
+                    .join(
+                        CandidateNormEvidence,
+                        CandidateNormEvidence.candidate_norm_id == CandidateNorm.id,
+                    )
+                    .where(
+                        CandidateNorm.cluster_id.in_(unrecorded),
+                        CandidateNormEvidence.active.is_(True),
+                    )
+                )
+            ).all():
+                previous_members[cluster_id].add(comment_id)
         await db.execute(
             delete(CommentClusterMember).where(
-                CommentClusterMember.cluster_id == cluster.id
+                CommentClusterMember.cluster_id.in_(previous_members)
             )
         )
+    # Labels are per-run numbers; park previous clusters on unique negative
+    # labels so this run's labels can be assigned without collisions.
+    for cluster in previous_clusters:
+        cluster.label = -cluster.id
     await db.flush()
 
     grouped: dict[int, list[int]] = {}
     for index, label in enumerate(labels):
         if label >= 0:
             grouped.setdefault(int(label), []).append(index)
+    centers = {
+        label: _centroid([vectors[index] for index in indices])
+        for label, indices in grouped.items()
+    }
+    matches = _match_clusters(
+        {
+            label: {comments[index].id for index in indices}
+            for label, indices in grouped.items()
+        },
+        centers,
+        previous_members,
+        vectors_by_comment,
+    )
+    clusters_by_id = {cluster.id: cluster for cluster in previous_clusters}
 
     norm_count = 0
+    norms_created = 0
     noise = labels.count(-1)
     for label, indices in sorted(grouped.items()):
-        group_vectors = [vectors[index] for index in indices]
-        center = _centroid(group_vectors)
-        similarities = [cosine_similarity(vectors[index], center) for index in indices]
+        similarities = [
+            cosine_similarity(vectors[index], centers[label]) for index in indices
+        ]
         confidence = min(
             1.0,
             (len(indices) / max(len(comments), 1)) * 0.5
             + (sum(similarities) / len(similarities)) * 0.5,
         )
-        cluster = existing_by_label.get(label)
+        cluster = clusters_by_id.get(matches.get(label, -1))
         if cluster is None:
             cluster = CommentCluster(
                 repository_id=repository_id,
@@ -284,6 +342,8 @@ async def mine_repository(
                 confidence=0.0,
             )
             db.add(cluster)
+        cluster.label = label
+        cluster.active = True
         cluster.algorithm_config = {
             "min_cluster_size": settings.phase2_min_cluster_size,
             "min_samples": settings.phase2_min_samples,
@@ -292,46 +352,74 @@ async def mine_repository(
         cluster.size = len(indices)
         cluster.confidence = confidence
         await db.flush()
-        representative_index = indices[similarities.index(max(similarities))]
+        representative = comments[indices[similarities.index(max(similarities))]]
         norm = await db.scalar(
             select(CandidateNorm).where(CandidateNorm.cluster_id == cluster.id)
         )
+        created = norm is None
         if norm is None:
             norm = CandidateNorm(
                 repository_id=repository_id,
                 cluster_id=cluster.id,
-                statement=comments[representative_index].normalized_body or "",
+                statement=representative.normalized_body or "",
                 confidence=confidence,
                 support_count=len(indices),
             )
             db.add(norm)
-        else:
-            norm.support_count = len(indices)
+            norms_created += 1
+        norm.support_count = len(indices)
         await db.flush()
         for index, similarity in zip(indices, similarities):
-            comment = comments[index]
             db.add(
                 CommentClusterMember(
                     cluster_id=cluster.id,
-                    review_comment_id=comment.id,
+                    review_comment_id=comments[index].id,
                     similarity_to_centroid=similarity,
                 )
             )
-            evidence = await db.scalar(
-                select(CandidateNormEvidence).where(
-                    CandidateNormEvidence.candidate_norm_id == norm.id,
-                    CandidateNormEvidence.review_comment_id == comment.id,
-                )
-            )
-            if evidence is None:
-                db.add(
-                    CandidateNormEvidence(
-                        candidate_norm_id=norm.id,
-                        review_comment_id=comment.id,
-                        pull_request_id=comment.pull_request_id,
-                    )
+        added, removed = await _sync_evidence(
+            db, norm, [comments[index] for index in indices]
+        )
+        if not created:
+            if not await _has_history(db, norm.id):
+                # Untouched machine candidate: keep it describing its cluster.
+                norm.statement = representative.normalized_body or norm.statement
+                norm.confidence = confidence
+            elif added or removed:
+                await record_version(
+                    db,
+                    norm,
+                    reason=(
+                        f"Mining run updated evidence: {added} comment(s) joined, "
+                        f"{removed} no longer clustered with this norm."
+                    ),
+                    changed_by=None,
                 )
         norm_count += 1
+
+    norms_retired = 0
+    matched_ids = set(matches.values())
+    for cluster in previous_clusters:
+        if cluster.id in matched_ids:
+            continue
+        cluster.active = False
+        cluster.size = 0
+        norm = await db.scalar(
+            select(CandidateNorm).where(CandidateNorm.cluster_id == cluster.id)
+        )
+        if norm is None:
+            continue
+        await ensure_initial_version(db, norm)
+        await _sync_evidence(db, norm, [])
+        if norm.status in {"emerging", "active"}:
+            norm.status = "weakening"
+        await record_version(
+            db,
+            norm,
+            reason="Mining no longer finds this norm's cluster; review it before relying on it.",
+            changed_by=None,
+        )
+        norms_retired += 1
 
     await db.commit()
     return MiningResult(
@@ -344,4 +432,100 @@ async def mine_repository(
         noise=noise,
         embeddings_reused=reused,
         embeddings_created=len(missing_comments),
+        norms_created=norms_created,
+        norms_retired=norms_retired,
+    )
+
+
+def _match_clusters(
+    groups: dict[int, set[int]],
+    centers: dict[int, Sequence[float]],
+    previous_members: dict[int, set[int]],
+    vectors_by_comment: dict[int, Sequence[float]],
+) -> dict[int, int]:
+    """Pair this run's cluster labels with previous cluster ids, one to one.
+
+    HDBSCAN labels are arbitrary per run, so identity comes from shared member
+    comments, falling back to centroid similarity when a cluster grew or
+    shifted enough that overlap alone is inconclusive.
+    """
+    previous_centers = {}
+    for cluster_id, members in previous_members.items():
+        present = [vectors_by_comment[i] for i in members if i in vectors_by_comment]
+        if present:
+            previous_centers[cluster_id] = _centroid(present)
+    candidates = []
+    for label, members in groups.items():
+        for cluster_id, previous in previous_members.items():
+            overlap = (
+                len(members & previous) / min(len(members), len(previous))
+                if previous
+                else 0.0
+            )
+            similarity = (
+                cosine_similarity(centers[label], previous_centers[cluster_id])
+                if cluster_id in previous_centers
+                else 0.0
+            )
+            if (
+                overlap >= MATCH_MIN_OVERLAP
+                or similarity >= MATCH_MIN_CENTROID_SIMILARITY
+            ):
+                candidates.append((overlap, similarity, label, cluster_id))
+    matches: dict[int, int] = {}
+    for _, _, label, cluster_id in sorted(candidates, reverse=True):
+        if label not in matches and cluster_id not in matches.values():
+            matches[label] = cluster_id
+    return matches
+
+
+async def _sync_evidence(
+    db: AsyncSession, norm: CandidateNorm, members: Sequence[ReviewComment]
+) -> tuple[int, int]:
+    """Make the norm's active evidence equal its cluster members.
+
+    Evidence rows are never deleted; comments that leave the cluster are
+    marked inactive so the norm's history stays traceable.
+    """
+    existing = {
+        evidence.review_comment_id: evidence
+        for evidence in (
+            await db.scalars(
+                select(CandidateNormEvidence).where(
+                    CandidateNormEvidence.candidate_norm_id == norm.id
+                )
+            )
+        ).all()
+    }
+    member_ids = {comment.id for comment in members}
+    added = removed = 0
+    for comment in members:
+        evidence = existing.get(comment.id)
+        if evidence is None:
+            db.add(
+                CandidateNormEvidence(
+                    candidate_norm_id=norm.id,
+                    review_comment_id=comment.id,
+                    pull_request_id=comment.pull_request_id,
+                )
+            )
+            added += 1
+        elif not evidence.active:
+            evidence.active = True
+            added += 1
+    for comment_id, evidence in existing.items():
+        if comment_id not in member_ids and evidence.active:
+            evidence.active = False
+            removed += 1
+    await db.flush()
+    return added, removed
+
+
+async def _has_history(db: AsyncSession, norm_id: int) -> bool:
+    return bool(
+        await db.scalar(
+            select(func.count(NormVersion.id)).where(
+                NormVersion.candidate_norm_id == norm_id
+            )
+        )
     )

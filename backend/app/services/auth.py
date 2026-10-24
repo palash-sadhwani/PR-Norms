@@ -7,8 +7,10 @@ import time
 
 import httpx
 import jwt
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.models import Installation, Repository
 
 
 def _state_secret() -> bytes:
@@ -47,8 +49,20 @@ def app_jwt() -> str:
     if not settings.github_app_id or not settings.github_private_key:
         raise RuntimeError("GitHub App credentials are not configured")
     now = int(time.time())
-    payload = {"iat": now - 60, "exp": now + 540, "iss": settings.github_app_id}
-    return jwt.encode(payload, settings.github_private_key, algorithm="RS256")
+    payload = {"iat": now - 60, "exp": now + 540, "iss": str(settings.github_app_id)}
+    # .env files usually hold the PEM on one line with escaped newlines.
+    private_key = settings.github_private_key.replace("\\n", "\n")
+    return jwt.encode(payload, private_key, algorithm="RS256")
+
+
+async def repository_token(db: AsyncSession, repository: Repository) -> str:
+    """Token for ingesting a repository; public imports use anonymous access."""
+    if repository.source == "github_public_api":
+        return ""
+    installation = await db.get(Installation, repository.installation_id)
+    if installation is None:
+        raise ValueError(f"installation {repository.installation_id} not found")
+    return await installation_token(installation.github_id)
 
 
 async def installation_token(installation_id: int) -> str:

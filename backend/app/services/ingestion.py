@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.models import (
     Commit,
     IngestionCheckpoint,
@@ -361,10 +362,12 @@ async def ingest_repository(
                         commit.pull_request_id = pr.id
                         commit.message = (item.get("commit") or {}).get("message", "")
                         commit.raw = item
-                    try:
-                        await collect_threads(db, github, repository, pr)
-                    except (httpx.HTTPError, KeyError, RuntimeError):
-                        pass
+                    # The GraphQL API rejects anonymous requests.
+                    if token or get_settings().github_token:
+                        try:
+                            await collect_threads(db, github, repository, pr)
+                        except (httpx.HTTPError, KeyError, RuntimeError):
+                            pass
                     last_number = payload["number"]
                     if checkpoint is None:
                         checkpoint = IngestionCheckpoint(
@@ -392,6 +395,8 @@ async def ingest_repository(
                     job = await db.get(IngestionJob, job_id)
                     if job is None:
                         raise ValueError(f"ingestion job {job_id} disappeared") from exc
+                    # The rollback undid this PR's total_items increment.
+                    job.total_items += 1
                     job.error_count += 1
                     job.error = str(exc)
                     await db.commit()

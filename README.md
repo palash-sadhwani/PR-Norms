@@ -1,8 +1,8 @@
 # PR-Norms
 
-PR-Norms collects GitHub pull-request review data and mines reproducible Phase 2
-candidate engineering norms from semantically similar comments. Phase 3 violation
-detection is not included.
+PR-Norms collects GitHub pull-request review data, mines candidate engineering
+norms from semantically similar review comments, lets people approve them, and
+flags provisional norm violations in imported pull requests.
 
 ## Quick start
 
@@ -12,6 +12,11 @@ docker compose up --build
 ```
 
 Backend API: `http://localhost:8000/docs`, frontend: `http://localhost:5173`.
+The backend applies database migrations on startup. The image includes the
+CPU-only Phase 2 dependencies; build with
+`docker compose build --build-arg INSTALL_PHASE2=false` for a smaller image
+without mining and analysis. Load the synthetic demo dataset with
+`docker compose exec backend python -m scripts.seed_demo`.
 Run backend checks with `cd backend && pip install -e ".[dev]" && pytest`.
 Install local Phase 2 models with `cd backend && pip install -e ".[phase2]"`.
 

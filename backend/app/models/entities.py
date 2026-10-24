@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import (
     JSON,
@@ -10,18 +10,24 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
 
 
+def utcnow() -> datetime:
+    """Naive UTC timestamp, matching the timezone-less DateTime columns."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 class Timestamped(Base):
     __abstract__ = True
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utcnow, onupdate=utcnow
     )
 
 
@@ -190,9 +196,11 @@ class CommentCluster(Timestamped):
     model_name: Mapped[str] = mapped_column(String(255))
     algorithm: Mapped[str] = mapped_column(String(64), default="hdbscan")
     algorithm_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Label from the latest mining run; retired clusters hold -id to stay unique.
     label: Mapped[int] = mapped_column(Integer)
     size: Mapped[int] = mapped_column(Integer, default=0)
     confidence: Mapped[float] = mapped_column()
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     __table_args__ = (
         UniqueConstraint("repository_id", "model_name", "algorithm", "label"),
     )
@@ -241,6 +249,8 @@ class CandidateNormEvidence(Timestamped):
     pull_request_id: Mapped[int] = mapped_column(
         ForeignKey("pull_requests.id"), index=True
     )
+    # False once the comment leaves the norm's cluster; the link is kept as history.
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     __table_args__ = (UniqueConstraint("candidate_norm_id", "review_comment_id"),)
 
 
@@ -312,6 +322,8 @@ class NormFinding(Timestamped):
     evidence_comment_ids: Mapped[list] = mapped_column(JSON, default=list)
     evidence_pull_request_ids: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(32), default="open")
+    # False for labeled findings a later re-analysis no longer produced.
+    current: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     __table_args__ = (
         UniqueConstraint("analysis_id", "candidate_norm_id", "file_path", "line_start"),
     )

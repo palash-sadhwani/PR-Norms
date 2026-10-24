@@ -1,5 +1,5 @@
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db.base import Base
@@ -11,6 +11,7 @@ from app.models import (
     Installation,
     NormConflict,
     NormFinding,
+    NormFindingFeedback,
     PullRequest,
     PullRequestFile,
     Repository,
@@ -161,6 +162,49 @@ async def test_analysis_suspected_violation_and_feedback():
             changed_by="dev",
         )
         assert feedback.decision == "dismissed"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reanalysis_keeps_labeled_findings():
+    engine, factory = await database()
+    async with factory() as db:
+        # Enforce foreign keys like Postgres so feedback cannot be orphaned.
+        await db.execute(text("PRAGMA foreign_keys=ON"))
+        _, pr, norm = await fixture(db, patch="@@ -1 +1 @@\n+db.session.execute(query)")
+        await analyze_pull_request(db, pr.id, embedder=FakeEmbedder())
+        finding = (await db.scalars(select(NormFinding))).one()
+        await record_feedback(
+            db, finding.id, decision="confirmed", note=None, changed_by="dev"
+        )
+        result = await analyze_pull_request(db, pr.id, embedder=FakeEmbedder())
+        assert result.findings == 1
+        rerun = (await db.scalars(select(NormFinding))).one()
+        assert rerun.id == finding.id
+        assert rerun.status == "confirmed"
+        assert (await db.scalars(select(NormFindingFeedback))).one().finding_id == finding.id
+        norm.status = "deprecated"
+        await db.commit()
+        result = await analyze_pull_request(db, pr.id, embedder=FakeEmbedder())
+        assert result.findings == 0
+        kept = (await db.scalars(select(NormFinding))).one()
+        assert kept.id == finding.id
+        assert kept.current is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_analysis_ignores_norm_terms_only_in_removed_lines():
+    engine, factory = await database()
+    async with factory() as db:
+        _, pr, _ = await fixture(
+            db,
+            patch="@@ -1,2 +1,2 @@\n-repository.layer.fetch()\n+db.session.execute(query)",
+        )
+        await analyze_pull_request(db, pr.id, embedder=FakeEmbedder())
+        finding = (await db.scalars(select(NormFinding))).one()
+        assert finding.violation_suspected is True
+        assert (finding.line_start, finding.line_end) == (1, 2)
     await engine.dispose()
 
 

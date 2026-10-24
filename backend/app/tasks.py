@@ -4,9 +4,9 @@ from celery import Celery
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal
-from app.models import Installation, Repository
+from app.models import Repository
 from app.services.analysis import analyze_pull_request
-from app.services.auth import installation_token
+from app.services.auth import repository_token
 from app.services.ingestion import ingest_repository as run_ingestion
 from app.services.phase2 import SentenceTransformerEmbedder
 from app.services.phase2 import mine_repository as run_phase2
@@ -29,10 +29,7 @@ def ingest_repository_task(
             repository = await db.get(Repository, repository_id)
             if repository is None:
                 raise ValueError(f"repository {repository_id} not found")
-            installation = await db.get(Installation, repository.installation_id)
-            if installation is None:
-                raise ValueError(f"installation {repository.installation_id} not found")
-            token = await installation_token(installation.github_id)
+            token = await repository_token(db, repository)
             return await run_ingestion(db, job_id, token, target_pr_number)
 
     asyncio.run(run())

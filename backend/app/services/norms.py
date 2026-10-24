@@ -26,7 +26,8 @@ async def _evidence_count(db: AsyncSession, norm_id: int) -> int:
     return int(
         await db.scalar(
             select(func.count(CandidateNormEvidence.id)).where(
-                CandidateNormEvidence.candidate_norm_id == norm_id
+                CandidateNormEvidence.candidate_norm_id == norm_id,
+                CandidateNormEvidence.active.is_(True),
             )
         )
         or 0

@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,8 +39,14 @@ from app.schemas.common import (
     PullRequestOut,
     RepositoryOut,
 )
-from app.services.analysis import analyze_pull_request, record_feedback
-from app.services.auth import create_oauth_state, installation_token, verify_oauth_state
+from app.services.analysis import RISK_FORMULA, analyze_pull_request, record_feedback
+from app.services.auth import (
+    app_jwt,
+    create_oauth_state,
+    installation_token,
+    repository_token,
+    verify_oauth_state,
+)
 from app.services.evaluation import evaluate_labels
 from app.services.github import GitHubClient, GitHubRequestError
 from app.services.ingestion import accept_delivery, ingest_repository
@@ -114,15 +120,17 @@ async def github_callback(
     if not installation_id:
         raise HTTPException(400, "missing installation_id")
 
-    token = await installation_token(installation_id)
-    async with GitHubClient(token) as github:
+    # Installation metadata needs the App JWT; its repositories need the
+    # installation token.
+    async with GitHubClient(app_jwt()) as github:
         installation = (
             await github.get(f"/app/installations/{installation_id}")
         ).json()
+    async with GitHubClient(await installation_token(installation_id)) as github:
         repositories = [
             item
             async for item in github.paginate(
-                f"/user/installations/{installation_id}/repositories"
+                "/installation/repositories", items_key="repositories"
             )
         ]
 
@@ -195,14 +203,7 @@ async def start_sync(repository_id: int, db: AsyncSession = Depends(get_db)):
     await db.refresh(job)
     if get_settings().local_demo_mode:
         try:
-            installation = await db.get(Installation, repository.installation_id)
-            if installation is None:
-                raise ValueError(f"installation {repository.installation_id} not found")
-            token = (
-                ""
-                if repository.raw.get("source") == "github_public_api"
-                else await installation_token(installation.github_id)
-            )
+            token = await repository_token(db, repository)
             result = await ingest_repository(db, job.id, token)
         except (GitHubRequestError, httpx.HTTPError, RuntimeError, ValueError) as exc:
             logger.exception(
@@ -371,7 +372,10 @@ async def pull_request_analysis(
         (
             await db.scalars(
                 select(NormFinding)
-                .where(NormFinding.analysis_id == analysis.id)
+                .where(
+                    NormFinding.analysis_id == analysis.id,
+                    NormFinding.current.is_(True),
+                )
                 .order_by(NormFinding.risk_score.desc())
             )
         ).all()
@@ -384,10 +388,7 @@ async def pull_request_analysis(
         "context_available": analysis.context_available,
         "findings_count": analysis.findings_count,
         "highest_risk": analysis.highest_risk,
-        "scoring_formula": (
-            "0.45*relevance + 0.35*evidence_strength + 0.20*norm_confidence; "
-            "high >= 0.80, medium >= 0.60, low otherwise"
-        ),
+        "scoring_formula": RISK_FORMULA,
         "findings": [
             {
                 "id": finding.id,
@@ -440,99 +441,41 @@ async def ingestion_status(job_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.get("/repositories/{repository_id}/stats")
 async def repository_stats(repository_id: int, db: AsyncSession = Depends(get_db)):
-    prs = list(
-        (
-            await db.scalars(
-                select(PullRequest).where(PullRequest.repository_id == repository_id)
-            )
-        ).all()
-    )
-    ids = [pr.id for pr in prs]
-    if not ids:
-        return {
-            "pull_requests": 0,
-            "reviews": 0,
-            "comments": 0,
-            "files": 0,
-            "commits": 0,
-            "candidate_norms": len(
-                (
-                    await db.scalars(
-                        select(CandidateNorm).where(
-                            CandidateNorm.repository_id == repository_id
-                        )
-                    )
-                ).all()
-            ),
-            "approved_norms": len(
-                (
-                    await db.scalars(
-                        select(CandidateNorm).where(
-                            CandidateNorm.repository_id == repository_id,
-                            CandidateNorm.approved.is_(True),
-                        )
-                    )
-                ).all()
-            ),
-            "analysis_findings": 0,
-        }
+    pr_ids = select(PullRequest.id).where(PullRequest.repository_id == repository_id)
+
+    async def count(model, *conditions) -> int:
+        return int(
+            await db.scalar(select(func.count(model.id)).where(*conditions)) or 0
+        )
 
     return {
-        "pull_requests": len(prs),
-        "reviews": len(
-            (
-                await db.scalars(select(Review).where(Review.pull_request_id.in_(ids)))
-            ).all()
+        "pull_requests": await count(
+            PullRequest, PullRequest.repository_id == repository_id
         ),
-        "comments": len(
-            (
-                await db.scalars(
-                    select(ReviewComment).where(ReviewComment.pull_request_id.in_(ids))
+        "reviews": await count(Review, Review.pull_request_id.in_(pr_ids)),
+        "comments": await count(
+            ReviewComment, ReviewComment.pull_request_id.in_(pr_ids)
+        ),
+        "files": await count(
+            PullRequestFile, PullRequestFile.pull_request_id.in_(pr_ids)
+        ),
+        "commits": await count(Commit, Commit.pull_request_id.in_(pr_ids)),
+        "candidate_norms": await count(
+            CandidateNorm, CandidateNorm.repository_id == repository_id
+        ),
+        "approved_norms": await count(
+            CandidateNorm,
+            CandidateNorm.repository_id == repository_id,
+            CandidateNorm.approved.is_(True),
+        ),
+        "analysis_findings": await count(
+            NormFinding,
+            NormFinding.current.is_(True),
+            NormFinding.analysis_id.in_(
+                select(PullRequestAnalysis.id).where(
+                    PullRequestAnalysis.pull_request_id.in_(pr_ids)
                 )
-            ).all()
-        ),
-        "files": len(
-            (
-                await db.scalars(
-                    select(PullRequestFile).where(
-                        PullRequestFile.pull_request_id.in_(ids)
-                    )
-                )
-            ).all()
-        ),
-        "commits": len(
-            (
-                await db.scalars(select(Commit).where(Commit.pull_request_id.in_(ids)))
-            ).all()
-        ),
-        "candidate_norms": len(
-            (
-                await db.scalars(
-                    select(CandidateNorm).where(
-                        CandidateNorm.repository_id == repository_id
-                    )
-                )
-            ).all()
-        ),
-        "approved_norms": len(
-            (
-                await db.scalars(
-                    select(CandidateNorm).where(
-                        CandidateNorm.repository_id == repository_id,
-                        CandidateNorm.approved.is_(True),
-                    )
-                )
-            ).all()
-        ),
-        "analysis_findings": len(
-            (
-                await db.scalars(
-                    select(NormFinding)
-                    .join(PullRequestAnalysis)
-                    .join(PullRequest)
-                    .where(PullRequest.repository_id == repository_id)
-                )
-            ).all()
+            ),
         ),
     }
 
@@ -601,47 +544,82 @@ async def semantic_clusters(repository_id: int, db: AsyncSession = Depends(get_d
         (
             await db.scalars(
                 select(CommentCluster)
-                .where(CommentCluster.repository_id == repository_id)
+                .where(
+                    CommentCluster.repository_id == repository_id,
+                    CommentCluster.active.is_(True),
+                )
                 .order_by(CommentCluster.label)
             )
         ).all()
     )
-    result = []
-    for cluster in clusters:
-        members = list(
-            (
-                await db.scalars(
-                    select(CommentClusterMember).where(
-                        CommentClusterMember.cluster_id == cluster.id
-                    )
-                )
-            ).all()
+    members_by_cluster: dict[int, list[int]] = {cluster.id: [] for cluster in clusters}
+    for cluster_id, comment_id in (
+        await db.execute(
+            select(
+                CommentClusterMember.cluster_id, CommentClusterMember.review_comment_id
+            ).where(CommentClusterMember.cluster_id.in_(members_by_cluster))
         )
-        result.append(
-            {
-                "id": cluster.id,
-                "label": cluster.label,
-                "model_name": cluster.model_name,
-                "algorithm": cluster.algorithm,
-                "size": cluster.size,
-                "confidence": cluster.confidence,
-                "comment_ids": [member.review_comment_id for member in members],
-                "comments": [
-                    {
-                        "id": comment.id,
-                        "body": comment.body,
-                        "path": comment.path,
-                        "line": comment.line,
-                        "pull_request_id": comment.pull_request_id,
-                    }
-                    for member in members
-                    if (
-                        comment := await db.get(ReviewComment, member.review_comment_id)
-                    )
-                ],
-            }
-        )
-    return result
+    ).all():
+        members_by_cluster[cluster_id].append(comment_id)
+    comments_by_id = await _comments_by_id(
+        db, [i for ids in members_by_cluster.values() for i in ids]
+    )
+    return [
+        {
+            "id": cluster.id,
+            "label": cluster.label,
+            "model_name": cluster.model_name,
+            "algorithm": cluster.algorithm,
+            "size": cluster.size,
+            "confidence": cluster.confidence,
+            "comment_ids": members_by_cluster[cluster.id],
+            "comments": [
+                {
+                    "id": comment.id,
+                    "body": comment.body,
+                    "path": comment.path,
+                    "line": comment.line,
+                    "pull_request_id": comment.pull_request_id,
+                }
+                for comment_id in members_by_cluster[cluster.id]
+                if (comment := comments_by_id.get(comment_id))
+            ],
+        }
+        for cluster in clusters
+    ]
+
+
+async def _comments_by_id(
+    db: AsyncSession, comment_ids: list[int]
+) -> dict[int, ReviewComment]:
+    if not comment_ids:
+        return {}
+    return {
+        comment.id: comment
+        for comment in (
+            await db.scalars(
+                select(ReviewComment).where(ReviewComment.id.in_(set(comment_ids)))
+            )
+        ).all()
+    }
+
+
+def _evidence_payload(
+    evidence: list[CandidateNormEvidence], comments: dict[int, ReviewComment]
+) -> list[dict]:
+    return [
+        {
+            "review_comment_id": item.review_comment_id,
+            "pull_request_id": item.pull_request_id,
+            "active": item.active,
+            "body": (
+                comments[item.review_comment_id].body
+                if item.review_comment_id in comments
+                else None
+            ),
+        }
+        for item in evidence
+    ]
 
 
 @router.post("/repositories/{repository_id}/mine", status_code=202)
@@ -690,43 +668,36 @@ async def candidate_norms(repository_id: int, db: AsyncSession = Depends(get_db)
             )
         ).all()
     )
-    result = []
-    for norm in norms:
-        evidence = list(
-            (
-                await db.scalars(
-                    select(CandidateNormEvidence).where(
-                        CandidateNormEvidence.candidate_norm_id == norm.id
-                    )
-                )
-            ).all()
+    evidence_by_norm: dict[int, list[CandidateNormEvidence]] = {
+        norm.id: [] for norm in norms
+    }
+    for item in (
+        await db.scalars(
+            select(CandidateNormEvidence)
+            .where(CandidateNormEvidence.candidate_norm_id.in_(evidence_by_norm))
+            .order_by(CandidateNormEvidence.id)
         )
-        result.append(
-            {
-                "id": norm.id,
-                "cluster_id": norm.cluster_id,
-                "statement": norm.statement,
-                "confidence": norm.confidence,
-                "classification": norm.classification,
-                "status": norm.status,
-                "approved": norm.approved,
-                "decision": norm.decision,
-                "support_count": norm.support_count,
-                "evidence": [
-                    {
-                        "review_comment_id": item.review_comment_id,
-                        "pull_request_id": item.pull_request_id,
-                        "body": (
-                            (await db.get(ReviewComment, item.review_comment_id)).body
-                            if await db.get(ReviewComment, item.review_comment_id)
-                            else None
-                        ),
-                    }
-                    for item in evidence
-                ],
-            }
-        )
-    return result
+    ).all():
+        evidence_by_norm[item.candidate_norm_id].append(item)
+    comments = await _comments_by_id(
+        db,
+        [item.review_comment_id for rows in evidence_by_norm.values() for item in rows],
+    )
+    return [
+        {
+            "id": norm.id,
+            "cluster_id": norm.cluster_id,
+            "statement": norm.statement,
+            "confidence": norm.confidence,
+            "classification": norm.classification,
+            "status": norm.status,
+            "approved": norm.approved,
+            "decision": norm.decision,
+            "support_count": norm.support_count,
+            "evidence": _evidence_payload(evidence_by_norm[norm.id], comments),
+        }
+        for norm in norms
+    ]
 
 
 @router.get("/candidate-norms/{norm_id}")
@@ -737,12 +708,13 @@ async def candidate_norm_detail(norm_id: int, db: AsyncSession = Depends(get_db)
     evidence = list(
         (
             await db.scalars(
-                select(CandidateNormEvidence).where(
-                    CandidateNormEvidence.candidate_norm_id == norm_id
-                )
+                select(CandidateNormEvidence)
+                .where(CandidateNormEvidence.candidate_norm_id == norm_id)
+                .order_by(CandidateNormEvidence.active.desc(), CandidateNormEvidence.id)
             )
         ).all()
     )
+    comments = await _comments_by_id(db, [item.review_comment_id for item in evidence])
     history = list(
         (
             await db.scalars(
@@ -763,18 +735,7 @@ async def candidate_norm_detail(norm_id: int, db: AsyncSession = Depends(get_db)
         "approved": norm.approved,
         "decision": norm.decision,
         "support_count": norm.support_count,
-        "evidence": [
-            {
-                "review_comment_id": item.review_comment_id,
-                "pull_request_id": item.pull_request_id,
-                "body": (
-                    (await db.get(ReviewComment, item.review_comment_id)).body
-                    if await db.get(ReviewComment, item.review_comment_id)
-                    else None
-                ),
-            }
-            for item in evidence
-        ],
+        "evidence": _evidence_payload(evidence, comments),
         "history": [
             {
                 "version": item.version,
