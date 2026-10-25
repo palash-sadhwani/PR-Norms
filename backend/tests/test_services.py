@@ -109,7 +109,14 @@ def test_public_import_accepts_bounded_counts_above_github_page_size():
 
 
 @pytest.mark.asyncio
-async def test_public_client_omits_authentication_header():
+@pytest.mark.parametrize("env_token", [None, "ghp_server_token"])
+async def test_public_client_omits_authentication_header(monkeypatch, env_token):
+    if env_token is None:
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_TOKEN", env_token)
+    get_settings.cache_clear()
+
     async def handler(request: httpx.Request) -> httpx.Response:
         assert "authorization" not in request.headers
         return httpx.Response(200, json={"id": 1})
@@ -117,8 +124,11 @@ async def test_public_client_omits_authentication_header():
     client = httpx.AsyncClient(
         base_url="https://api.github.com", transport=httpx.MockTransport(handler)
     )
-    async with GitHubClient("", client) as github:
-        response = await github.get("/repos/acme/demo")
+    try:
+        async with GitHubClient("", client) as github:
+            response = await github.get("/repos/acme/demo")
+    finally:
+        get_settings.cache_clear()
     assert response.json()["id"] == 1
 
 
@@ -180,3 +190,42 @@ async def test_public_import_route_maps_missing_repository_to_404(monkeypatch):
             None,
         )
     assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env_token,expected", [(None, ""), ("ghp_server_token", "ghp_server_token")])
+async def test_public_repository_sync_uses_only_explicit_server_token(
+    monkeypatch, env_token, expected
+):
+    from app.models import Repository
+    from app.services.auth import repository_token
+
+    if env_token is None:
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_TOKEN", env_token)
+    get_settings.cache_clear()
+    try:
+        repository = Repository(raw={"source": "github_public_api"})
+        assert await repository_token(None, repository) == expected
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_authenticated_client_sends_given_token(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_server_token")
+    get_settings.cache_clear()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer installation-token"
+        return httpx.Response(200, json={"id": 1})
+
+    client = httpx.AsyncClient(
+        base_url="https://api.github.com", transport=httpx.MockTransport(handler)
+    )
+    try:
+        async with GitHubClient("installation-token", client) as github:
+            assert (await github.get("/repos/acme/demo")).status_code == 200
+    finally:
+        get_settings.cache_clear()
