@@ -53,7 +53,13 @@ class SentenceTransformerEmbedder:
                 'Install with `pip install -e ".[phase2]"`.'
             ) from exc
         self.model_name = model_name
-        self._model = SentenceTransformer(model_name)
+        try:
+            self._model = SentenceTransformer(model_name)
+        except Exception as exc:
+            # Download/proxy/cache failures surface as many exception types.
+            raise RuntimeError(
+                f"Embedding model {model_name!r} could not be loaded: {exc}"
+            ) from exc
 
     def encode(
         self, texts: Sequence[str], batch_size: int
@@ -424,7 +430,7 @@ async def mine_repository(
     await db.commit()
     return MiningResult(
         len(comments),
-        len(comments),
+        len(comments) - noise,
         len(grouped),
         norm_count,
         eligible=len(comments),
