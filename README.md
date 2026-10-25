@@ -26,7 +26,10 @@ synchronously. Celery remains the default when the switch is unset or false.
 An optional `GITHUB_TOKEN` may be set in the backend terminal only; it is never
 sent to the browser.
 
-See `docs/architecture.md` for the boundaries and ingestion guarantees.
+See `docs/architecture.md` for the boundaries and ingestion guarantees and
+`docs/PROJECT_STATUS.md` for what has been verified. Check the full mining and
+analysis workflow on a new SQLite file with
+`cd backend && python -m scripts.verify_workflow --database ./verify.db`.
 
 Configure a GitHub App with pull-request read access, contents read access,
 metadata read access, and repository webhook delivery. Set the App slug,
