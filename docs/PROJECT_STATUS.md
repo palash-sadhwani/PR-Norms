@@ -34,7 +34,25 @@ walkthrough is in `docs/DEMO_GUIDE.md`.
 - **Full `docker compose up`:** the Phase 2 image, worker, Redis and frontend
   container were not run together.
 
-## Changes in this branch
+## Import reliability fixes (`fix/public-import-reliability`)
+
+1. **`greenlet_spawn` error** (`ingestion.ingest_repository`): after one PR
+   failed, the handler's `db.rollback()` expired `repository`; the next PR read
+   `repository.full_name`, an implicit synchronous refresh, which raised
+   `MissingGreenlet`. That was caught as another item error, so every later PR
+   failed the same way. The handler now reloads `repository` after the rollback.
+2. **Rate limits** (`github.GitHubClient.get`): an exhausted primary limit raised
+   only after three futile retries; it now fails at once with the limit, whether
+   a token was used, and the reset time. `Retry-After` up to 30 s is honoured;
+   longer waits, and secondary-limit 403s without it, are reported. 401 says
+   the token was rejected.
+3. **Import stops at the rate limit** and ends `rate_limited` instead of trying
+   every remaining PR; a rerun resumes without duplicates.
+4. **API and UI**: `/connection/status` reports whether a token is loaded (never
+   its value); database failures return a distinct 500; the UI distinguishes
+   complete, partial, rate-limited and failed imports.
+
+## Changes in earlier branches
 
 1. Anonymous `GitHubClient("")` no longer inherits `GITHUB_TOKEN`; public syncs
    and imports pass the optional server token explicitly; GraphQL runs only with
@@ -65,8 +83,8 @@ walkthrough is in `docs/DEMO_GUIDE.md`.
 
 ## Tests (latest run)
 
-- Backend `pytest`: **42 passed, 1 skipped** (the Postgres-only Celery test; it
-  passed earlier against Postgres 16).
+- Backend `pytest`: **57 passed, 1 skipped** without Postgres; **58 passed** with
+  `PRNORMS_TEST_POSTGRES_URL` pointing at a local Postgres 16.
 - `ruff check` (backend and `demo/`): clean. Frontend `tsc -b` and
   `npm run build`: clean.
 - `verify_workflow.py --demo-fallback`: completes. A real-model run stops at

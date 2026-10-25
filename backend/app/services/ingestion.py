@@ -21,7 +21,7 @@ from app.models import (
     User,
     WebhookDelivery,
 )
-from app.services.github import GitHubClient
+from app.services.github import GitHubClient, GitHubRequestError
 from app.services.preprocess import preprocess_comment
 
 THREADS_QUERY = """
@@ -226,9 +226,10 @@ async def ingest_repository(
     job = await db.get(IngestionJob, job_id)
     if job is None:
         raise ValueError(f"ingestion job {job_id} not found")
-    repository = await db.get(Repository, job.repository_id)
+    repository_id = job.repository_id
+    repository = await db.get(Repository, repository_id)
     if repository is None:
-        raise ValueError(f"repository {job.repository_id} not found")
+        raise ValueError(f"repository {repository_id} not found")
     job.status = "running"
     job.error = None
     await db.commit()
@@ -251,6 +252,7 @@ async def ingest_repository(
     processed_count = 0
     seen_count = 0
     seen_github_ids: set[int] = set()
+    rate_limit: GitHubRequestError | None = None
     try:
         async with GitHubClient(token) as github:
 
@@ -391,10 +393,16 @@ async def ingest_repository(
                     SQLAlchemyError,
                     ValueError,
                 ) as exc:
+                    # A rollback expires every loaded object; reload the ones the
+                    # loop reads, or the next attribute access does implicit IO
+                    # outside the async context (MissingGreenlet).
                     await db.rollback()
                     job = await db.get(IngestionJob, job_id)
                     if job is None:
                         raise ValueError(f"ingestion job {job_id} disappeared") from exc
+                    repository = await db.get(Repository, repository_id)
+                    if repository is None:
+                        raise ValueError(f"repository {repository_id} disappeared") from exc
                     # The rollback undid this PR's total_items increment.
                     job.total_items += 1
                     job.error_count += 1
@@ -406,7 +414,15 @@ async def ingest_repository(
                             IngestionCheckpoint.resource == "pull_requests",
                         )
                     )
-        job.status = "partial_failed" if job.error_count else "completed"
+                    if isinstance(exc, GitHubRequestError) and exc.rate_limited:
+                        # Every further request would fail too; stop and let a
+                        # retry resume from the checkpoint after the reset.
+                        rate_limit = exc
+                        break
+        if rate_limit is not None:
+            job.status = "rate_limited"
+        else:
+            job.status = "partial_failed" if job.error_count else "completed"
         job.current_stage = None
         await db.commit()
         return job
@@ -414,7 +430,8 @@ async def ingest_repository(
         await db.rollback()
         job = await db.get(IngestionJob, job_id)
         if job:
-            job.status = "failed"
+            rate_limited = isinstance(exc, GitHubRequestError) and exc.rate_limited
+            job.status = "rate_limited" if rate_limited else "failed"
             job.error = str(exc)
             await db.commit()
         raise

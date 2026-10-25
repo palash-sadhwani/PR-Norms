@@ -24,6 +24,10 @@ cd frontend && npm ci && npm run dev -- --host 127.0.0.1 --port 5173
 Open http://127.0.0.1:5173. The first mining run downloads
 `sentence-transformers/all-MiniLM-L6-v2` (about 90 MB) from Hugging Face.
 
+On Windows, `.\start.ps1` does the above in two new windows once
+`backend\.venv` and `frontend\node_modules` exist (it uses
+`backend\presentation.db`).
+
 Docker alternative: `cp .env.example .env && docker compose up --build`.
 
 ### Environment variables
@@ -32,7 +36,7 @@ Docker alternative: `cp .env.example .env && docker compose up --build`.
 |---|---|
 | `DATABASE_URL` | SQLite or Postgres URL. Use a new SQLite file for the demo. |
 | `LOCAL_DEMO_MODE` | `true` runs sync, mining and analysis inline (no Redis/Celery). |
-| `GITHUB_TOKEN` | Optional, backend only. Raises the GitHub rate limit from 60 to 5,000 requests/hour. Placeholder: `ghp_your_token_here`. Never commit it. |
+| `GITHUB_TOKEN` | Optional, backend only. Raises the GitHub rate limit from 60 to 5,000 requests/hour; an import costs about 5 requests per PR, so without a token roughly 10 PRs per hour. Put it in `backend/.env` (the backend reads `.env` from the folder it starts in, not the repository root) or set it in the terminal before starting the backend or `start.ps1`. The import panel says when no token is loaded. Placeholder: `ghp_your_token_here`. Never commit it. |
 | `PHASE2_EMBEDDING_BACKEND` | `sentence-transformers` (default, the real model) or `demo-hashing` (labelled lexical fallback for machines that cannot download the model). |
 | `PHASE2_MIN_CLUSTER_SIZE` | Minimum comments per norm (default 3). |
 
@@ -49,6 +53,10 @@ formal reviews, line-level review comments, conversation (issue) comments,
 changed files with diffs, and commits, keyed by GitHub IDs so re-imports update
 rather than duplicate. Private repositories need `GITHUB_TOKEN` or the GitHub
 App; access errors are shown as a readable 403, never replaced with other data.
+
+An import ends as **complete**, **partial** (some PRs failed; the last error is
+shown), **rate-limited** (stopped at GitHub's limit; the reset time is shown and
+a rerun continues without duplicating) or **failed**.
 
 Only line-level review comments are mined. If a repository has none, the
 dashboard says so.

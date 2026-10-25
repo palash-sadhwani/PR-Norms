@@ -61,6 +61,8 @@ function Dashboard() {
   const [importLimit, setImportLimit] = useState("25");
   const [importMessage, setImportMessage] = useState("");
   const [includeOpen, setIncludeOpen] = useState(true);
+  const [importFailed, setImportFailed] = useState(false);
+  const connection = useQuery({ queryKey: ["connection"], queryFn: () => request<{ github_token_configured: boolean }>("/connection/status") });
   const queryClient = useQueryClient();
   const repositories = useQuery({ queryKey: ["repositories"], queryFn: () => request<Repository[]>("/repositories") });
   const selected = repositories.data?.find((repo) => repo.id === repositoryId);
@@ -79,7 +81,14 @@ function Dashboard() {
     onSuccess: (result) => {
       setRepositoryId(result.repository_id);
       setJobId(result.job_id);
-      setImportMessage(`${result.status === "completed" ? "Real GitHub data imported" : "Import completed with errors"}: ${result.completed_items}/${result.total_items} PRs processed${result.error_count ? `, ${result.error_count} errors` : ""}`);
+      const counts = `${result.completed_items} of ${result.total_items} PRs imported${result.error_count ? `, ${result.error_count} failed` : ""}`;
+      const messages: Record<string, string> = {
+        completed: `Import complete: ${counts}.`,
+        partial_failed: `Partial import: ${counts}. Last error: ${result.error}`,
+        rate_limited: `Import stopped by the GitHub rate limit: ${counts}. ${result.error} Imported PRs are kept; run the import again after the reset to continue.`,
+      };
+      setImportFailed(result.status !== "completed");
+      setImportMessage(messages[result.status] ?? `Import ${result.status}: ${counts}. ${result.error ?? ""}`);
       repositories.refetch();
       queryClient.invalidateQueries({ queryKey: ["stats", result.repository_id] });
       queryClient.invalidateQueries({ queryKey: ["pull-requests", result.repository_id] });
@@ -89,7 +98,7 @@ function Dashboard() {
     queryKey: ["ingestion", jobId],
     queryFn: () => request<{ status: string; completed_items: number; total_items: number; error: string | null }>(`/ingestion/${jobId}`),
     enabled: jobId !== null,
-    refetchInterval: (query) => ["completed", "failed", "partial_failed"].includes(query.state.data?.status ?? "") ? false : 2000,
+    refetchInterval: (query) => ["completed", "failed", "partial_failed", "rate_limited"].includes(query.state.data?.status ?? "") ? false : 2000,
   });
   const selectedPr = pullRequests.data?.find((pr) => pr.id === pullRequestId);
 
@@ -116,10 +125,11 @@ function Dashboard() {
           <button disabled={!publicRepository.trim() || publicImport.isPending || maxPullRequests < 1 || maxPullRequests > 1000 || (importLimit === "custom" && !customPullRequests)} onClick={() => publicImport.mutate()}>{publicImport.isPending ? "Importing…" : "Import public repository"}</button>
         </div>
         {publicImport.isError && <div className="error">{(publicImport.error as Error).message}</div>}
-        {importMessage && <p className="job">{importMessage} · capped at {maxPullRequests} recent {includeOpen ? "open and closed" : "closed"} PRs.</p>}
+        {importMessage && <p className={`job ${importFailed ? "job-error" : ""}`}>{importMessage} Requested up to {maxPullRequests} recent {includeOpen ? "open and closed" : "closed"} PRs.</p>}
+        {connection.data && !connection.data.github_token_configured && <p className="muted">No GitHub token is configured for the backend: GitHub allows 60 requests per hour, about 10 pull requests per hour at roughly 5 requests each. Set GITHUB_TOKEN before starting the backend.</p>}
       </section>
       <StateMessage loading={repositories.isLoading} error={repositories.error as Error} empty={!repositories.data?.length ? "No repositories connected yet. Connect the GitHub App to begin." : undefined} />
-      {job.data && <div className={`job ${job.data.status.includes("fail") ? "job-error" : ""}`}>Import status: <strong>{job.data.status}</strong> · {job.data.completed_items}/{job.data.total_items || "?"} pull requests{job.data.error && ` · ${job.data.error}`}</div>}
+      {job.data && <div className={`job ${job.data.status !== "completed" && job.data.status !== "running" && job.data.status !== "queued" ? "job-error" : ""}`}>Import status: <strong>{job.data.status}</strong> · {job.data.completed_items}/{job.data.total_items || "?"} pull requests{job.data.error && ` · ${job.data.error}`}</div>}
       {selected && <><nav className="tabs">{(["overview", "norms", "analyzer", "evaluation"] as const).map((item) => <button className={tab === item ? "active" : ""} onClick={() => setTab(item)} key={item}>{item === "overview" ? "Dashboard" : item === "norms" ? "Norm Explorer" : item === "analyzer" ? "PR Analyzer" : "Evaluation"}</button>)}</nav>
         <section className="stats">{["pull_requests", "reviews", "comments", "issue_comments", "candidate_norms", "approved_norms", "analysis_findings", "feedback"].map((key) => <div className="stat" key={key}><span>{key.replace(/_/g, " ")}</span><strong>{stats.data?.[key] ?? "—"}</strong></div>)}</section>
         {stats.data && stats.data.pull_requests > 0 && stats.data.comments === 0 && <p className="job">No line-level review comments were imported for this repository. Norm mining needs code-review discussion; formal review summaries and general PR conversation are shown but not mined.</p>}

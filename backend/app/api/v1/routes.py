@@ -6,7 +6,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -200,7 +200,13 @@ async def embedding_config():
 
 @router.get("/connection/status")
 async def connection_status():
-    return {"status": "ok", "github_configured": bool(get_settings().github_app_id)}
+    settings = get_settings()
+    return {
+        "status": "ok",
+        "github_configured": bool(settings.github_app_id),
+        # Whether a token was loaded (environment or backend/.env), never its value.
+        "github_token_configured": bool(settings.github_token),
+    }
 
 
 @router.get("/repositories", response_model=list[RepositoryOut])
@@ -277,7 +283,9 @@ async def public_import(payload: PublicImportIn, db: AsyncSession = Depends(get_
             raise HTTPException(429, str(exc)) from exc
         if exc.status_code == 404:
             raise HTTPException(404, str(exc)) from exc
-        if exc.status_code in (401, 403):
+        if exc.status_code == 401:
+            raise HTTPException(401, str(exc)) from exc
+        if exc.status_code == 403:
             raise HTTPException(
                 403,
                 f"GitHub refused access to {payload.repository} ({exc.status_code}). "
@@ -290,6 +298,11 @@ async def public_import(payload: PublicImportIn, db: AsyncSession = Depends(get_
         )
         raise HTTPException(
             503, "GitHub could not be reached. Check the network and try again."
+        ) from None
+    except SQLAlchemyError:
+        logger.exception("Saving the public import failed for %s", payload.repository)
+        raise HTTPException(
+            500, "The import could not be saved to the database. See the backend log."
         ) from None
     return {
         "source": "github_public_api",

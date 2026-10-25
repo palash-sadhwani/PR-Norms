@@ -1,10 +1,14 @@
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Self
 
 import httpx
 
 from app.core.config import get_settings
+
+# Longer secondary-limit waits are reported instead of blocking the request.
+MAX_RETRY_WAIT_SECONDS = 30
 
 
 class GitHubRequestError(RuntimeError):
@@ -46,6 +50,25 @@ class GitHubClient:
             headers["Authorization"] = "Bearer " + self.token
         return headers
 
+    def _rate_limit_error(self, response: httpx.Response) -> GitHubRequestError:
+        reset_at = response.headers.get("x-ratelimit-reset")
+        limit = response.headers.get("x-ratelimit-limit")
+        parts = ["GitHub API rate limit exceeded"]
+        if limit:
+            parts.append(f" ({limit} requests/hour")
+            parts.append(", authenticated)" if self.token else ", unauthenticated)")
+        parts.append(".")
+        if reset_at and reset_at.isdigit():
+            when = datetime.fromtimestamp(int(reset_at), UTC).strftime("%H:%M UTC")
+            parts.append(f" It resets at {when}.")
+        else:
+            parts.append(" Try again after the limit resets.")
+        if not self.token:
+            parts.append(" Set GITHUB_TOKEN for the backend to raise the limit.")
+        return GitHubRequestError(
+            "".join(parts), status_code=429, rate_limited=True, reset_at=reset_at
+        )
+
     async def get(self, path: str, **params) -> httpx.Response:
         if self.client is None:
             raise RuntimeError("GitHubClient must be used as an async context manager")
@@ -55,22 +78,36 @@ class GitHubClient:
                 path, params=params, headers=self._headers()
             )
             last_response = response
-            # Secondary rate limits are 403s that carry retry-after.
-            rate_limited = response.status_code == 403 and (
-                response.headers.get("x-ratelimit-remaining") == "0"
-                or "retry-after" in response.headers
-            )
-            if response.status_code in {429, 500, 502, 503, 504} or rate_limited:
-                if attempt == 3:
-                    break
-                retry_after = response.headers.get("retry-after")
+            exhausted = response.headers.get("x-ratelimit-remaining") == "0"
+            retry_after = response.headers.get("retry-after")
+            if response.status_code in {403, 429} and exhausted:
+                # The primary limit only recovers at x-ratelimit-reset; retrying is futile.
+                raise self._rate_limit_error(response)
+            if (
+                response.status_code == 403
+                and retry_after is None
+                and "rate limit" in response.text.lower()
+            ):
+                # Secondary limit without retry-after: GitHub asks for a wait of at
+                # least a minute, which is reported rather than slept through.
+                raise self._rate_limit_error(response)
+            secondary = response.status_code in {403, 429} and retry_after is not None
+            if secondary or response.status_code in {429, 500, 502, 503, 504}:
                 delay = float(retry_after) if retry_after else 2**attempt
+                if attempt == 3 or delay > MAX_RETRY_WAIT_SECONDS:
+                    break
                 await asyncio.sleep(delay)
                 continue
             if response.status_code == 404:
                 raise GitHubRequestError(
-                    "GitHub repository or resource was not found.",
+                    "GitHub repository or resource was not found. Private repositories "
+                    "also return 404 without access.",
                     status_code=404,
+                )
+            if response.status_code == 401:
+                raise GitHubRequestError(
+                    "GitHub rejected the configured token (401). Check GITHUB_TOKEN.",
+                    status_code=401,
                 )
             if response.status_code >= 400:
                 raise GitHubRequestError(
@@ -79,20 +116,11 @@ class GitHubClient:
                 )
             return response
         if last_response is not None:
-            rate_limited = last_response.status_code == 429 or (
+            if last_response.status_code == 429 or (
                 last_response.status_code == 403
-                and (
-                    last_response.headers.get("x-ratelimit-remaining") == "0"
-                    or "retry-after" in last_response.headers
-                )
-            )
-            if rate_limited:
-                raise GitHubRequestError(
-                    "GitHub API rate limit exceeded. Try again after the limit resets.",
-                    status_code=429,
-                    rate_limited=True,
-                    reset_at=last_response.headers.get("x-ratelimit-reset"),
-                )
+                and "retry-after" in last_response.headers
+            ):
+                raise self._rate_limit_error(last_response)
             raise GitHubRequestError(
                 "GitHub API request failed after retries.",
                 status_code=last_response.status_code,
