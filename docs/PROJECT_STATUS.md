@@ -29,8 +29,8 @@ Only items that were actually executed are marked verified.
 ## Changes in this branch
 
 1. Anonymous `GitHubClient("")` no longer inherits `GITHUB_TOKEN`. Public
-   repository syncs request the optional server token explicitly via
-   `repository_token`.
+   repository syncs and public imports pass the optional server token
+   explicitly, and GraphQL runs only when the client has a token.
 2. Celery tasks dispose the async engine before their event loop closes. Before
    this, the second task in a worker process failed on Postgres with an
    asyncpg "attached to a different loop" error (reproduced).
@@ -44,7 +44,8 @@ Only items that were actually executed are marked verified.
 ## Tests (latest run)
 
 - Local, Python 3.13, with `[dev,phase2]` and Postgres: **37 passed**, both with
-  and without `GITHUB_TOKEN` set.
+  and without `GITHUB_TOKEN` set. After the review fix: **38 passed, 1 skipped**
+  (Postgres test; Postgres was not running for that final run).
 - Backend image (no Phase 2), `./backend` mounted as in compose: **35 passed,
   2 skipped** (the Postgres-only and Phase 2-only tests).
 - `ruff check .`: clean. `tsc -b` and `npm run build`: clean.
