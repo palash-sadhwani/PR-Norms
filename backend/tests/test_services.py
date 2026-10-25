@@ -283,3 +283,14 @@ def test_preprocess_drops_trailing_signature_footer_but_keeps_raw_text():
     assert result.normalized_text == "Load the API key from the environment."
     assert result.raw_text == body
     assert preprocess_comment("a --- b").normalized_text == "a --- b"
+
+
+def test_outdated_review_comment_reports_its_original_line():
+    from app.models import ReviewComment
+
+    outdated = ReviewComment(path="a.py", line=None, original_line=9, pull_request_id=1, raw={})
+    current = ReviewComment(path="a.py", line=4, original_line=3, pull_request_id=1, raw={})
+    assert routes._comment_detail(outdated, {1: 7})["line"] == 9
+    assert routes._comment_detail(outdated, {1: 7})["outdated"] is True
+    assert routes._comment_detail(current, {1: 7})["line"] == 4
+    assert routes._comment_detail(current, {1: 7})["pull_request_number"] == 7

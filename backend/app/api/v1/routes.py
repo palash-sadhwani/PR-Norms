@@ -712,7 +712,9 @@ def _comment_detail(comment: ReviewComment | None, pr_numbers: dict[int, int]) -
     return {
         "body": comment.body,
         "path": comment.path,
-        "line": comment.line,
+        # GitHub nulls `line` once later commits make a comment outdated.
+        "line": comment.line if comment.line is not None else comment.original_line,
+        "outdated": comment.line is None and comment.original_line is not None,
         "pull_request_number": pr_numbers.get(comment.pull_request_id),
         "html_url": (comment.raw or {}).get("html_url"),
     }

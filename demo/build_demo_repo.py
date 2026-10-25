@@ -712,6 +712,8 @@ class GitHub:
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         data = json.dumps(body).encode() if body is not None else None
+        if data is not None:
+            headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
@@ -733,7 +735,14 @@ def populate(root: Path, repository: str) -> None:
     branches = [s["branch"] for s in SCENARIOS] + [
         s["branch"] + "-fix" for s in SCENARIOS if "fix_files" in s
     ]
-    run("git", "push", "-q", "origin", "main", *[f"{b}:{b}" for b in branches if not b.endswith("-fix")], cwd=root)
+    remote = run("git", "ls-remote", "--heads", "origin", cwd=root)
+    missing = [
+        f"{b}:{b}"
+        for b in ["main", *branches]
+        if not b.endswith("-fix") and f"refs/heads/{b}\n" not in remote + "\n"
+    ]
+    if missing:  # never re-push over branches that already moved on GitHub
+        run("git", "push", "-q", "origin", *missing, cwd=root)
     existing = {pr["head"]["ref"]: pr for pr in github.call("GET", "/pulls?state=all&per_page=100")}
     for scenario in SCENARIOS:
         branch = scenario["branch"]
@@ -766,13 +775,14 @@ def populate(root: Path, repository: str) -> None:
         if pr.get("merged_at"):
             continue
         run("git", "push", "-q", "origin", f"{branch}-fix:{branch}", cwd=root)
-        github.call("POST", f"/issues/{number}/comments", {"body": scenario["reply"] + FOOTER})
+        if not github.call("GET", f"/issues/{number}/comments"):
+            github.call("POST", f"/issues/{number}/comments", {"body": scenario["reply"] + FOOTER})
         for _ in range(10):  # mergeability is computed asynchronously after a push
             try:
                 github.call("PUT", f"/pulls/{number}/merge", {"merge_method": "merge"})
                 break
             except SystemExit as exc:
-                if " 405 " not in str(exc):
+                if " 405 " not in str(exc) and " 409 " not in str(exc):
                     raise
                 time.sleep(3)
 

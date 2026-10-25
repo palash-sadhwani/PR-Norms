@@ -74,6 +74,9 @@ Each of PRs 1 to 6 gets a review with three inline comments, a correction commit
 a follow-up reply, and is merged. Each norm therefore has three supporting
 comments from three different PRs.
 
+`palash-sadhwani/PR-Norms-Demo` is already populated this way. To recreate it
+elsewhere:
+
 1. Create an **empty public** repository named `PR-Norms-Demo` on GitHub (no
    README, licence or .gitignore).
 2. Populate it from a machine with git push access:

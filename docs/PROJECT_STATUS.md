@@ -9,10 +9,11 @@ walkthrough is in `docs/DEMO_GUIDE.md`.
 | Area | How it was verified |
 |---|---|
 | Migrations (SQLite, Postgres 16) | `alembic upgrade head` on fresh SQLite files, a local Postgres 16, and the `postgres:16` image |
-| Real GitHub import | `POST /public/import` of `palash-sadhwani/PR-Norms` through the app: 1 PR, 14 files, 6 commits stored; re-import is idempotent by GitHub ID |
+| Real GitHub import | `POST /public/import` of `palash-sadhwani/PR-Norms` (1 PR, 14 files, 6 commits) and of `palash-sadhwani/PR-Norms-Demo` (7 PRs, 6 reviews, 18 line-level review comments, 6 conversation comments, 10 files, 13 commits) |
+| Demo repository published | `demo/build_demo_repo.py populate`: PRs #1–#6 each have one COMMENT review with 3 inline comments, a correction commit, a reply, and are merged; #7 is open and unreviewed (checked through the GitHub API) |
+| Demo workflow, **fallback embedder only** | Through the app on a fresh SQLite file: mining gave 6 norms (3 comments from 3 different PRs each, no noise); all 6 approved; analysis of #7 gave 3 findings (hardcoded credential at `shipping.py:5-7`, query in a loop at `12-14`, missing test at `12-14`); all 9 evidence links match GitHub's PR number, file, original line and text; feedback and evaluation submitted in the browser (3 labels: precision 0.67, recall 1.0, F1 0.80) |
 | Import errors | Inaccessible repository → readable 403; malformed identifier → 400 |
 | Mining → approve → analyze → feedback → evaluation | `scripts/verify_workflow.py --demo-fallback` through the HTTP routes, with real HDBSCAN and the labelled `demo-hashing` embedder |
-| Demo scenarios through mining and analysis | Scratch dry run of the 18 scripted demo comments through `mine_repository` and `analyze_pull_request` (fallback embedder): 6 norms with 3 comments each; the open shipping PR gets findings for the hardcoded-credential, missing-test and query-in-loop norms |
 | Demo repository code | `demo/build_demo_repo.py git` builds every branch; each corrected branch passes its own `pytest` |
 | Celery task bodies on Postgres | Three consecutive tasks in one process (`tests/test_tasks.py`) |
 | Missing models or worker | `/mine` and `/analyze` return 503 with a readable message; `/sync` returns 503 when Redis is down |
@@ -24,9 +25,8 @@ walkthrough is in `docs/DEMO_GUIDE.md`.
 - **Real Sentence Transformers model:** this environment's network policy blocks
   `huggingface.co` and `download.pytorch.org`. Mining and analysis quality with
   the real model are unknown, including whether real-model relevance reaches 0.55.
-- **Import of PR-Norms-Demo:** the repository does not exist yet. The GitHub App
-  in this environment may not create repositories (403), so it has to be
-  created by its owner (see `docs/DEMO_GUIDE.md`).
+- **Real-model run on the demo repository:** importing worked, but `/mine` with the
+  default backend returned 503 (`403 Forbidden` from Hugging Face).
 - **Public repositories other than session-attached ones:** this environment's
   proxy only allows GitHub API calls for attached repositories.
 - **GraphQL review threads:** GraphQL is blocked here; resolved/outdated thread
@@ -59,10 +59,13 @@ walkthrough is in `docs/DEMO_GUIDE.md`.
 12. UI: fallback banner, open-PR import, issue-comment and feedback counts, empty
     state for repositories without review comments, evidence with GitHub links.
 13. `demo/build_demo_repo.py` and `docs/DEMO_GUIDE.md`.
+14. Evidence reports `original_line` for review comments GitHub marks outdated
+    (its `line` is null after later commits), flagged `outdated`.
+15. Submitting feedback refreshes the dashboard counts.
 
 ## Tests (latest run)
 
-- Backend `pytest`: **41 passed, 1 skipped** (the Postgres-only Celery test; it
+- Backend `pytest`: **42 passed, 1 skipped** (the Postgres-only Celery test; it
   passed earlier against Postgres 16).
 - `ruff check` (backend and `demo/`): clean. Frontend `tsc -b` and
   `npm run build`: clean.
@@ -74,7 +77,9 @@ walkthrough is in `docs/DEMO_GUIDE.md`.
 - The violation signal is heuristic (key norm terms absent from added lines), so
   nearly every relevant norm is marked suspected. Findings are provisional.
 - With the fallback embedder, the demo shipping PR's logging and validation
-  issues score below the 0.55 relevance threshold and are missed.
+  issues score below the 0.55 relevance threshold and are missed, and the
+  missing-test finding is anchored to the loop lines by word overlap.
+- Feedback is an append-only history; evaluation uses each finding's latest label.
 - Norm confidence is cluster cohesion plus share of comments, not a probability.
 - Formal review summaries are stored and shown but not mined.
 - Issue comments and review comments share a unique `github_id` column; GitHub
@@ -100,6 +105,6 @@ docker run --rm -v "$PWD/backend:/app" prnorms-backend pytest -q
 
 ## Remaining priorities
 
-1. Create PR-Norms-Demo, populate it, and run the full demo through the UI.
-2. Run the demo once with the real model on a machine that can reach Hugging Face.
+1. Run the demo once with the real model on a machine that can reach Hugging Face.
+2. Decide whether formal review summaries should also be mined.
 3. Run `docker compose up --build` end to end, including a queued mine and analyze.
