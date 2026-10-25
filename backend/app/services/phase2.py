@@ -93,7 +93,8 @@ class HashingEmbedder:
         vectors = []
         for text in texts:
             vector = [0.0] * self.dimensions
-            for token in re.findall(r"[a-z0-9_]+", text.lower()):
+            # Split identifiers such as api_key into words.
+            for token in re.findall(r"[a-z0-9]+", text.lower()):
                 if len(token) > 2:
                     digest = hashlib.sha256(token.encode()).digest()
                     vector[int.from_bytes(digest[:4], "big") % self.dimensions] += 1.0

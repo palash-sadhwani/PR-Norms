@@ -217,3 +217,19 @@ async def test_conflicting_norm_is_not_used():
         assert result.findings == 0
         assert await db.get(NormConflict, 1) is None
     await engine.dispose()
+
+
+def test_added_windows_track_new_file_line_numbers():
+    from app.services.analysis import _added_windows
+
+    patch = "@@ -1,3 +10,4 @@\n context\n-removed\n+first\n+second\n context\n+third"
+    windows = _added_windows(patch, size=2)
+    assert windows == [(11, 12, "first\nsecond"), (12, 14, "second\nthird")]
+    assert _added_windows("@@ -0,0 +1,1 @@\n+only", size=3) == [(1, 1, "only")]
+
+
+def test_hunk_tail_keeps_the_commented_lines():
+    from app.services.analysis import _hunk_tail
+
+    hunk = "@@ -0,0 +1,4 @@\n+a = 1\n+b = 2\n+KEY = 'x'\n+log(KEY)"
+    assert _hunk_tail(hunk, size=2) == "KEY = 'x'\nlog(KEY)"

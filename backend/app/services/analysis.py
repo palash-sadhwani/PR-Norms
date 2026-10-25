@@ -101,6 +101,36 @@ def _added_text(patch: str) -> str:
     )
 
 
+CODE_WINDOW_LINES = 3
+
+
+def _added_windows(patch: str, size: int = CODE_WINDOW_LINES) -> list[tuple[int, int, str]]:
+    """Sliding windows of consecutive added lines as (first line, last line, text)."""
+    added: list[tuple[int, str]] = []
+    new_line = 0
+    for line in patch.splitlines():
+        header = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", line)
+        if header:
+            new_line = int(header.group(1))
+        elif line.startswith("+") and not line.startswith("+++"):
+            added.append((new_line, line[1:]))
+            new_line += 1
+        elif not line.startswith("-"):
+            new_line += 1
+    windows = []
+    for start in range(max(1, len(added) - size + 1)):
+        chunk = added[start : start + size]
+        if chunk and any(text.strip() for _, text in chunk):
+            windows.append((chunk[0][0], chunk[-1][0], "\n".join(text for _, text in chunk)))
+    return windows
+
+
+def _hunk_tail(diff_hunk: str, size: int = CODE_WINDOW_LINES) -> str:
+    """The lines a review comment was attached to: the end of its diff hunk."""
+    lines = [line[1:] for line in diff_hunk.splitlines() if not line.startswith("@@")]
+    return "\n".join(lines[-size:])
+
+
 def _line_range(patch: str | None) -> tuple[int | None, int | None]:
     if not patch:
         return None, None
@@ -305,11 +335,28 @@ async def analyze_pull_request(
     if hunk_comments:
         encoded = list(
             embedder.encode(
-                [f"{item.path or ''}\n{item.diff_hunk}" for item in hunk_comments],
+                [_hunk_tail(item.diff_hunk) for item in hunk_comments],
                 batch_size=batch_size,
             )
         )
         hunk_vectors = {item.id: vector for item, vector in zip(hunk_comments, encoded)}
+    patched_files = [item for item in files if item.patch]
+    windows_by_file = {item.id: _added_windows(item.patch) for item in patched_files}
+    flat_windows = [window for item in patched_files for window in windows_by_file[item.id]]
+    window_vectors = (
+        list(embedder.encode([text for _, _, text in flat_windows], batch_size=batch_size))
+        if hunk_vectors and flat_windows
+        else []
+    )
+    vectors_by_file: dict[int, list[tuple[int, int, Sequence[float]]]] = {}
+    position = 0
+    for item in patched_files:
+        count = len(windows_by_file[item.id]) if window_vectors else 0
+        vectors_by_file[item.id] = [
+            (start, end, window_vectors[position + index])
+            for index, (start, end, _) in enumerate(windows_by_file[item.id][:count])
+        ]
+        position += count
     findings: list[NormFinding] = []
     for file, context, vector in zip(
         [item for item in files if item.patch], contexts, vectors
@@ -327,14 +374,14 @@ async def analyze_pull_request(
             text_relevance = max(
                 cosine_similarity(vector, embedding.vector) for embedding in embeddings
             )
-            code_relevance = max(
-                (
-                    cosine_similarity(vector, hunk_vectors[comment_id])
-                    for comment_id in comment_ids
-                    if comment_id in hunk_vectors
-                ),
-                default=0.0,
-            )
+            # Best match between a few added lines and the code a reviewer flagged.
+            code_relevance, best_window = 0.0, None
+            for start, end, window_vector in vectors_by_file.get(file.id, []):
+                for comment_id in comment_ids:
+                    if comment_id in hunk_vectors:
+                        score = cosine_similarity(window_vector, hunk_vectors[comment_id])
+                        if score > code_relevance:
+                            code_relevance, best_window = score, (start, end)
             relevance = max(text_relevance, code_relevance)
             if relevance < relevance_threshold:
                 continue
@@ -363,7 +410,11 @@ async def analyze_pull_request(
                 )
             else:
                 explanation += "No deterministic contradiction signal was found."
-            line_start, line_end = _line_range(file.patch)
+            line_start, line_end = (
+                best_window
+                if best_window and code_relevance >= text_relevance
+                else _line_range(file.patch)
+            )
             findings.append(
                 NormFinding(
                     analysis_id=analysis.id,
