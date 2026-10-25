@@ -7,7 +7,6 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
 from app.models import (
     Commit,
     IngestionCheckpoint,
@@ -363,7 +362,7 @@ async def ingest_repository(
                         commit.message = (item.get("commit") or {}).get("message", "")
                         commit.raw = item
                     # The GraphQL API rejects anonymous requests.
-                    if token or get_settings().github_token:
+                    if token:
                         try:
                             await collect_threads(db, github, repository, pr)
                         except (httpx.HTTPError, KeyError, RuntimeError):

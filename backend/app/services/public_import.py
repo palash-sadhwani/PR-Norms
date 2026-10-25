@@ -87,7 +87,7 @@ async def import_public_repository(
     return await ingest_repository(
         db,
         job.id,
-        "",
+        get_settings().github_token or "",
         max_pull_requests=max_pull_requests,
         recent_closed_only=True,
     )

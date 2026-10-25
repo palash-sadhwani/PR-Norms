@@ -229,3 +229,49 @@ async def test_authenticated_client_sends_given_token(monkeypatch):
             assert (await github.get("/repos/acme/demo")).status_code == 200
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env_token,expected", [(None, ""), ("ghp_server_token", "ghp_server_token")])
+async def test_public_import_ingests_with_the_lookup_token(monkeypatch, env_token, expected):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.db.base import Base
+    from app.services import public_import
+
+    if env_token is None:
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_TOKEN", env_token)
+    get_settings.cache_clear()
+    tokens = []
+
+    class LookupClient:
+        def __init__(self, token):
+            tokens.append(token)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def get(self, path):
+            return httpx.Response(200, json={"id": 7, "default_branch": "main"})
+
+    async def fake_ingest(db, job_id, token, **kwargs):
+        tokens.append(token)
+        return job_id
+
+    monkeypatch.setattr(public_import, "GitHubClient", LookupClient)
+    monkeypatch.setattr(public_import, "ingest_repository", fake_ingest)
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+            await public_import.import_public_repository(db, "acme/demo", 1)
+    finally:
+        await engine.dispose()
+        get_settings.cache_clear()
+    assert tokens == [expected, expected]
