@@ -56,9 +56,9 @@ def app_jwt() -> str:
 
 
 async def repository_token(db: AsyncSession, repository: Repository) -> str:
-    """Token for ingesting a repository; public imports use anonymous access."""
+    """Token for ingesting a repository; public imports use the optional GITHUB_TOKEN."""
     if repository.source == "github_public_api":
-        return ""
+        return get_settings().github_token or ""
     installation = await db.get(Installation, repository.installation_id)
     if installation is None:
         raise ValueError(f"installation {repository.installation_id} not found")

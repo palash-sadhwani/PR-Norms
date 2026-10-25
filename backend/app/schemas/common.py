@@ -63,3 +63,5 @@ class FindingFeedbackIn(BaseModel):
 class PublicImportIn(BaseModel):
     repository: str
     max_pull_requests: int = Field(default=50, ge=1, le=1000)
+    # Open PRs are what a reviewer usually wants analyzed.
+    include_open: bool = False

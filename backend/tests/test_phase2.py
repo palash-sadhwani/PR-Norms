@@ -300,3 +300,68 @@ async def test_phase2_handles_fewer_comments_than_cluster_size():
         assert await db.scalar(select(func.count()).select_from(CommentEmbedding)) == 1
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_phase2_clustered_count_excludes_noise():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    class NoiseClusterer:
+        def fit_predict(self, vectors):
+            return [-1] * len(vectors)
+
+    async with factory() as db:
+        installation = Installation(github_id=1, account_login="acme")
+        db.add(installation)
+        await db.flush()
+        repository = Repository(
+            installation_id=installation.id, github_id=2, full_name="acme/demo"
+        )
+        db.add(repository)
+        await db.flush()
+        pr = PullRequest(
+            repository_id=repository.id, github_id=3, number=1, title="x", state="open"
+        )
+        db.add(pr)
+        await db.flush()
+        db.add_all(
+            [
+                ReviewComment(
+                    pull_request_id=pr.id,
+                    github_id=10 + index,
+                    body=f"comment {index}",
+                    normalized_body=f"comment {index}",
+                    is_filtered=False,
+                )
+                for index in range(4)
+            ]
+        )
+        await db.commit()
+
+        result = await mine_repository(
+            db, repository.id, embedder=SingleCommentEmbedder(), clusterer=NoiseClusterer()
+        )
+
+    assert result.embedded == 4
+    assert result.noise == 4
+    assert result.clustered == 0
+    assert result.clusters == 0
+    await engine.dispose()
+
+
+def test_unloadable_embedding_model_raises_runtime_error(monkeypatch):
+    import sys
+    import types
+
+    from app.services.phase2 import SentenceTransformerEmbedder
+
+    def unavailable(name):
+        raise OSError("403 Forbidden")
+
+    module = types.SimpleNamespace(SentenceTransformer=unavailable)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", module)
+    with pytest.raises(RuntimeError, match="could not be loaded"):
+        SentenceTransformerEmbedder("missing/model")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -18,6 +19,7 @@ from app.models import (
     CommentCluster,
     CommentClusterMember,
     CommentEmbedding,
+    IssueComment,
     NormVersion,
     PullRequest,
     Repository,
@@ -29,6 +31,11 @@ from app.services.norms import ensure_initial_version, record_version
 # cluster's comments are shared, or when their centroids nearly coincide.
 MATCH_MIN_OVERLAP = 0.5
 MATCH_MIN_CENTROID_SIMILARITY = 0.9
+# Stored under its own model name so fallback vectors never mix with real ones.
+DEMO_FALLBACK_MODEL = "demo-fallback/hashing-bag-of-words-v1"
+# Below this many comments HDBSCAN's default min_samples marks nearly
+# everything as noise, so a configured-unset min_samples drops to 1.
+SMALL_DATASET_COMMENTS = 50
 
 
 class Embedder(Protocol):
@@ -53,7 +60,13 @@ class SentenceTransformerEmbedder:
                 'Install with `pip install -e ".[phase2]"`.'
             ) from exc
         self.model_name = model_name
-        self._model = SentenceTransformer(model_name)
+        try:
+            self._model = SentenceTransformer(model_name)
+        except Exception as exc:
+            # Download/proxy/cache failures surface as many exception types.
+            raise RuntimeError(
+                f"Embedding model {model_name!r} could not be loaded: {exc}"
+            ) from exc
 
     def encode(
         self, texts: Sequence[str], batch_size: int
@@ -66,6 +79,43 @@ class SentenceTransformerEmbedder:
             show_progress_bar=False,
         )
         return vectors.tolist()
+
+
+class HashingEmbedder:
+    """Lexical bag-of-words vectors for offline demos. Not a semantic model."""
+
+    dimensions = 512
+    model_name = DEMO_FALLBACK_MODEL
+
+    def encode(
+        self, texts: Sequence[str], batch_size: int
+    ) -> Sequence[Sequence[float]]:
+        vectors = []
+        for text in texts:
+            vector = [0.0] * self.dimensions
+            # Split identifiers such as api_key into words.
+            for token in re.findall(r"[a-z0-9]+", text.lower()):
+                if len(token) > 2:
+                    digest = hashlib.sha256(token.encode()).digest()
+                    vector[int.from_bytes(digest[:4], "big") % self.dimensions] += 1.0
+            norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+            vectors.append([value / norm for value in vector])
+        return vectors
+
+
+def is_fallback_model(model_name: str | None) -> bool:
+    return model_name == DEMO_FALLBACK_MODEL
+
+
+def create_embedder(model_name: str | None = None) -> Embedder:
+    settings = get_settings()
+    if settings.phase2_embedding_backend == "demo-hashing":
+        return HashingEmbedder()
+    if settings.phase2_embedding_backend != "sentence-transformers":
+        raise RuntimeError(
+            f"Unknown PHASE2_EMBEDDING_BACKEND {settings.phase2_embedding_backend!r}"
+        )
+    return SentenceTransformerEmbedder(model_name or settings.phase2_embedding_model)
 
 
 class HdbscanClusterer:
@@ -151,6 +201,8 @@ async def mine_repository(
                     PullRequest.repository_id == repository_id,
                     ReviewComment.is_filtered.is_(False),
                     ReviewComment.normalized_body.is_not(None),
+                    # Norms come from code-review comments, not general PR conversation.
+                    ReviewComment.id.not_in(select(IssueComment.id)),
                 )
                 .order_by(ReviewComment.id)
             )
@@ -166,7 +218,9 @@ async def mine_repository(
     if not comments:
         return MiningResult(0, 0, 0, 0, eligible=0, excluded=excluded)
 
-    embedder = embedder or SentenceTransformerEmbedder(model_name)
+    embedder = embedder or create_embedder(model_name)
+    # Store vectors under the name analysis will look them up by.
+    model_name = embedder.model_name
     existing_embeddings = {
         embedding.review_comment_id: embedding
         for embedding in (
@@ -236,9 +290,12 @@ async def mine_repository(
             embeddings_created=len(missing_comments),
         )
 
+    min_samples = settings.phase2_min_samples
+    if min_samples is None and len(vectors) < SMALL_DATASET_COMMENTS:
+        min_samples = 1
     clusterer = clusterer or HdbscanClusterer(
         settings.phase2_min_cluster_size,
-        settings.phase2_min_samples,
+        min_samples,
         settings.phase2_random_seed,
     )
     labels = list(clusterer.fit_predict(vectors))
@@ -424,7 +481,7 @@ async def mine_repository(
     await db.commit()
     return MiningResult(
         len(comments),
-        len(comments),
+        len(comments) - noise,
         len(grouped),
         norm_count,
         eligible=len(comments),

@@ -26,7 +26,8 @@ class GitHubRequestError(RuntimeError):
 
 class GitHubClient:
     def __init__(self, token: str, client: httpx.AsyncClient | None = None):
-        self.token = token or get_settings().github_token or ""
+        # An empty token means anonymous; callers opt in to GITHUB_TOKEN explicitly.
+        self.token = token
         self.client = client
         self._owned = client is None
 

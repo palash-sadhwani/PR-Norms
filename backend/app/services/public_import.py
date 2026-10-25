@@ -31,7 +31,7 @@ def _installation_id(full_name: str) -> int:
 
 
 async def import_public_repository(
-    db: AsyncSession, value: str, max_pull_requests: int = 50
+    db: AsyncSession, value: str, max_pull_requests: int = 50, include_open: bool = False
 ) -> IngestionJob:
     full_name = parse_repository_identifier(value)
     maximum = get_settings().public_import_max_pull_requests
@@ -87,7 +87,8 @@ async def import_public_repository(
     return await ingest_repository(
         db,
         job.id,
-        "",
+        get_settings().github_token or "",
         max_pull_requests=max_pull_requests,
         recent_closed_only=True,
+        include_open=include_open,
     )

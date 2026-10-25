@@ -7,7 +7,6 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
 from app.models import (
     Commit,
     IngestionCheckpoint,
@@ -222,6 +221,7 @@ async def ingest_repository(
     target_pr_number: int | None = None,
     max_pull_requests: int | None = None,
     recent_closed_only: bool = False,
+    include_open: bool = False,
 ) -> IngestionJob:
     job = await db.get(IngestionJob, job_id)
     if job is None:
@@ -264,7 +264,7 @@ async def ingest_repository(
                     return
                 async for item in github.paginate(
                     f"/repos/{repository.full_name}/pulls",
-                    state="closed" if recent_closed_only else "all",
+                    state="closed" if recent_closed_only and not include_open else "all",
                     sort="updated" if recent_closed_only else "created",
                     direction="desc" if recent_closed_only else "asc",
                 ):
@@ -363,7 +363,7 @@ async def ingest_repository(
                         commit.message = (item.get("commit") or {}).get("message", "")
                         commit.raw = item
                     # The GraphQL API rejects anonymous requests.
-                    if token or get_settings().github_token:
+                    if token:
                         try:
                             await collect_threads(db, github, repository, pr)
                         except (httpx.HTTPError, KeyError, RuntimeError):
