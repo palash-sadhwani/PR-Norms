@@ -19,6 +19,7 @@ from app.models import (
     Commit,
     IngestionJob,
     Installation,
+    IssueComment,
     NormFinding,
     NormFindingFeedback,
     NormVersion,
@@ -51,7 +52,12 @@ from app.services.evaluation import evaluate_labels
 from app.services.github import GitHubClient, GitHubRequestError
 from app.services.ingestion import accept_delivery, ingest_repository
 from app.services.norms import approve_norm, mark_conflict, reject_norm, update_norm
-from app.services.phase2 import SentenceTransformerEmbedder, mine_repository
+from app.services.phase2 import (
+    DEMO_FALLBACK_MODEL,
+    create_embedder,
+    is_fallback_model,
+    mine_repository,
+)
 from app.services.public_import import import_public_repository
 from app.services.webhooks import verify_signature
 from app.tasks import (
@@ -180,6 +186,18 @@ async def github_repositories(db: AsyncSession = Depends(get_db)):
     )
 
 
+@router.get("/embedding/config")
+async def embedding_config():
+    """Which embedder mining and analysis will use, so the UI can label fallbacks."""
+    settings = get_settings()
+    fallback = settings.phase2_embedding_backend == "demo-hashing"
+    return {
+        "backend": settings.phase2_embedding_backend,
+        "model_name": DEMO_FALLBACK_MODEL if fallback else settings.phase2_embedding_model,
+        "fallback": fallback,
+    }
+
+
 @router.get("/connection/status")
 async def connection_status():
     return {"status": "ok", "github_configured": bool(get_settings().github_app_id)}
@@ -249,7 +267,7 @@ async def pull_requests(repository_id: int, db: AsyncSession = Depends(get_db)):
 async def public_import(payload: PublicImportIn, db: AsyncSession = Depends(get_db)):
     try:
         job = await import_public_repository(
-            db, payload.repository, payload.max_pull_requests
+            db, payload.repository, payload.max_pull_requests, payload.include_open
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -259,6 +277,12 @@ async def public_import(payload: PublicImportIn, db: AsyncSession = Depends(get_
             raise HTTPException(429, str(exc)) from exc
         if exc.status_code == 404:
             raise HTTPException(404, str(exc)) from exc
+        if exc.status_code in (401, 403):
+            raise HTTPException(
+                403,
+                f"GitHub refused access to {payload.repository} ({exc.status_code}). "
+                "Private repositories need a GITHUB_TOKEN or GitHub App with read access.",
+            ) from exc
         raise HTTPException(503, str(exc)) from exc
     except httpx.HTTPError:
         logger.exception(
@@ -295,9 +319,26 @@ async def comments(pull_request_id: int, db: AsyncSession = Depends(get_db)):
     return list(
         (
             await db.scalars(
-                select(ReviewComment).where(
-                    ReviewComment.pull_request_id == pull_request_id
+                select(ReviewComment)
+                .where(
+                    ReviewComment.pull_request_id == pull_request_id,
+                    ReviewComment.id.not_in(select(IssueComment.id)),
                 )
+                .order_by(ReviewComment.id)
+            )
+        ).all()
+    )
+
+
+@router.get("/pull-requests/{pull_request_id}/issue-comments")
+async def issue_comments(pull_request_id: int, db: AsyncSession = Depends(get_db)):
+    """General PR conversation, kept apart from line-level review comments."""
+    return list(
+        (
+            await db.scalars(
+                select(IssueComment)
+                .where(IssueComment.pull_request_id == pull_request_id)
+                .order_by(IssueComment.id)
             )
         ).all()
     )
@@ -326,18 +367,19 @@ async def analyze_pull_request_route(
         raise HTTPException(404, "pull request not found")
     if inline or get_settings().local_demo_mode:
         try:
+            embedder = create_embedder()
             result = await analyze_pull_request(
                 db,
                 pull_request_id,
-                embedder=SentenceTransformerEmbedder(
-                    get_settings().phase2_embedding_model
-                ),
+                embedder=embedder,
                 batch_size=get_settings().phase2_embedding_batch_size,
             )
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(503, str(exc)) from exc
         return {
             "status": "completed",
+            "embedding_model": embedder.model_name,
+            "embedding_fallback": is_fallback_model(embedder.model_name),
             "analysis_id": result.analysis_id,
             "findings": result.findings,
             "context_available": result.context_available,
@@ -380,6 +422,23 @@ async def pull_request_analysis(
             )
         ).all()
     )
+    payload = _finding_rows(findings)
+    comments = await _comments_by_id(
+        db, [i for finding in payload for i in finding["evidence_comment_ids"]]
+    )
+    pr_numbers = await _pull_request_numbers(
+        db, [comment.pull_request_id for comment in comments.values()]
+    )
+    norm_ids = {finding["candidate_norm_id"] for finding in payload}
+    statements = dict(
+        (
+            await db.execute(
+                select(CandidateNorm.id, CandidateNorm.statement).where(
+                    CandidateNorm.id.in_(norm_ids)
+                )
+            )
+        ).all()
+    ) if norm_ids else {}
     return {
         "id": analysis.id,
         "pull_request_id": analysis.pull_request_id,
@@ -391,25 +450,42 @@ async def pull_request_analysis(
         "scoring_formula": RISK_FORMULA,
         "findings": [
             {
-                "id": finding.id,
-                "candidate_norm_id": finding.candidate_norm_id,
-                "file_path": finding.file_path,
-                "line_start": finding.line_start,
-                "line_end": finding.line_end,
-                "relevance_score": finding.relevance_score,
-                "evidence_strength": finding.evidence_strength,
-                "risk_score": finding.risk_score,
-                "risk_level": finding.risk_level,
-                "provisional": finding.provisional,
-                "violation_suspected": finding.violation_suspected,
-                "explanation": finding.explanation,
-                "evidence_comment_ids": finding.evidence_comment_ids,
-                "evidence_pull_request_ids": finding.evidence_pull_request_ids,
-                "status": finding.status,
+                **finding,
+                "norm_statement": statements.get(finding["candidate_norm_id"]),
+                "evidence": [
+                    {
+                        "review_comment_id": comment_id,
+                        **_comment_detail(comments.get(comment_id), pr_numbers),
+                    }
+                    for comment_id in finding["evidence_comment_ids"]
+                ],
             }
-            for finding in findings
+            for finding in payload
         ],
     }
+
+
+def _finding_rows(findings: list[NormFinding]) -> list[dict]:
+    return [
+        {
+            "id": finding.id,
+            "candidate_norm_id": finding.candidate_norm_id,
+            "file_path": finding.file_path,
+            "line_start": finding.line_start,
+            "line_end": finding.line_end,
+            "relevance_score": finding.relevance_score,
+            "evidence_strength": finding.evidence_strength,
+            "risk_score": finding.risk_score,
+            "risk_level": finding.risk_level,
+            "provisional": finding.provisional,
+            "violation_suspected": finding.violation_suspected,
+            "explanation": finding.explanation,
+            "evidence_comment_ids": finding.evidence_comment_ids,
+            "evidence_pull_request_ids": finding.evidence_pull_request_ids,
+            "status": finding.status,
+        }
+        for finding in findings
+    ]
 
 
 @router.post("/norm-findings/{finding_id}/feedback")
@@ -454,7 +530,12 @@ async def repository_stats(repository_id: int, db: AsyncSession = Depends(get_db
         ),
         "reviews": await count(Review, Review.pull_request_id.in_(pr_ids)),
         "comments": await count(
-            ReviewComment, ReviewComment.pull_request_id.in_(pr_ids)
+            ReviewComment,
+            ReviewComment.pull_request_id.in_(pr_ids),
+            ReviewComment.id.not_in(select(IssueComment.id)),
+        ),
+        "issue_comments": await count(
+            IssueComment, IssueComment.pull_request_id.in_(pr_ids)
         ),
         "files": await count(
             PullRequestFile, PullRequestFile.pull_request_id.in_(pr_ids)
@@ -467,6 +548,18 @@ async def repository_stats(repository_id: int, db: AsyncSession = Depends(get_db
             CandidateNorm,
             CandidateNorm.repository_id == repository_id,
             CandidateNorm.approved.is_(True),
+        ),
+        "feedback": await count(
+            NormFindingFeedback,
+            NormFindingFeedback.finding_id.in_(
+                select(NormFinding.id).where(
+                    NormFinding.analysis_id.in_(
+                        select(PullRequestAnalysis.id).where(
+                            PullRequestAnalysis.pull_request_id.in_(pr_ids)
+                        )
+                    )
+                )
+            ),
         ),
         "analysis_findings": await count(
             NormFinding,
@@ -604,19 +697,38 @@ async def _comments_by_id(
     }
 
 
+async def _pull_request_numbers(db: AsyncSession, ids: list[int]) -> dict[int, int]:
+    if not ids:
+        return {}
+    rows = await db.execute(
+        select(PullRequest.id, PullRequest.number).where(PullRequest.id.in_(set(ids)))
+    )
+    return dict(rows.all())
+
+
+def _comment_detail(comment: ReviewComment | None, pr_numbers: dict[int, int]) -> dict:
+    if comment is None:
+        return {"body": None}
+    return {
+        "body": comment.body,
+        "path": comment.path,
+        "line": comment.line,
+        "pull_request_number": pr_numbers.get(comment.pull_request_id),
+        "html_url": (comment.raw or {}).get("html_url"),
+    }
+
+
 def _evidence_payload(
-    evidence: list[CandidateNormEvidence], comments: dict[int, ReviewComment]
+    evidence: list[CandidateNormEvidence],
+    comments: dict[int, ReviewComment],
+    pr_numbers: dict[int, int],
 ) -> list[dict]:
     return [
         {
             "review_comment_id": item.review_comment_id,
             "pull_request_id": item.pull_request_id,
             "active": item.active,
-            "body": (
-                comments[item.review_comment_id].body
-                if item.review_comment_id in comments
-                else None
-            ),
+            **_comment_detail(comments.get(item.review_comment_id), pr_numbers),
         }
         for item in evidence
     ]
@@ -633,17 +745,16 @@ async def start_semantic_mining(
         raise HTTPException(404, "repository not found")
     if inline or get_settings().local_demo_mode:
         try:
-            result = await mine_repository(
-                db,
-                repository_id,
-                embedder=SentenceTransformerEmbedder(
-                    model_name or get_settings().phase2_embedding_model
-                ),
-                model_name=model_name,
-            )
+            embedder = create_embedder(model_name)
+            result = await mine_repository(db, repository_id, embedder=embedder)
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(503, str(exc)) from exc
-        return {"status": "completed", **result.__dict__}
+        return {
+            "status": "completed",
+            "embedding_model": embedder.model_name,
+            "embedding_fallback": is_fallback_model(embedder.model_name),
+            **result.__dict__,
+        }
     await _ensure_worker_available()
     try:
         task = mine_repository_task.apply_async(
@@ -683,6 +794,9 @@ async def candidate_norms(repository_id: int, db: AsyncSession = Depends(get_db)
         db,
         [item.review_comment_id for rows in evidence_by_norm.values() for item in rows],
     )
+    pr_numbers = await _pull_request_numbers(
+        db, [comment.pull_request_id for comment in comments.values()]
+    )
     return [
         {
             "id": norm.id,
@@ -694,7 +808,7 @@ async def candidate_norms(repository_id: int, db: AsyncSession = Depends(get_db)
             "approved": norm.approved,
             "decision": norm.decision,
             "support_count": norm.support_count,
-            "evidence": _evidence_payload(evidence_by_norm[norm.id], comments),
+            "evidence": _evidence_payload(evidence_by_norm[norm.id], comments, pr_numbers),
         }
         for norm in norms
     ]
@@ -715,6 +829,9 @@ async def candidate_norm_detail(norm_id: int, db: AsyncSession = Depends(get_db)
         ).all()
     )
     comments = await _comments_by_id(db, [item.review_comment_id for item in evidence])
+    pr_numbers = await _pull_request_numbers(
+        db, [comment.pull_request_id for comment in comments.values()]
+    )
     history = list(
         (
             await db.scalars(
@@ -735,7 +852,7 @@ async def candidate_norm_detail(norm_id: int, db: AsyncSession = Depends(get_db)
         "approved": norm.approved,
         "decision": norm.decision,
         "support_count": norm.support_count,
-        "evidence": _evidence_payload(evidence, comments),
+        "evidence": _evidence_payload(evidence, comments, pr_numbers),
         "history": [
             {
                 "version": item.version,

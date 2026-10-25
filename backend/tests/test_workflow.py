@@ -11,7 +11,7 @@ BACKEND = Path(__file__).resolve().parents[1]
 @pytest.mark.skipif(
     importlib.util.find_spec("hdbscan") is None, reason="needs the phase2 extra"
 )
-def test_mining_and_analysis_workflow_with_stand_in_embedder(tmp_path):
+def test_mining_and_analysis_workflow_with_demo_fallback_embedder(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
@@ -19,7 +19,7 @@ def test_mining_and_analysis_workflow_with_stand_in_embedder(tmp_path):
             "scripts.verify_workflow",
             "--database",
             str(tmp_path / "verify.db"),
-            "--stand-in-embedder",
+            "--demo-fallback",
         ],
         check=False,
         cwd=BACKEND,

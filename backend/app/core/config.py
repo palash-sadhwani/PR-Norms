@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     github_token: str | None = None
     backend_cors_origins: str = "http://localhost:5173"
     phase2_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # "sentence-transformers" (default) or "demo-hashing", an explicitly
+    # labelled lexical fallback for environments that cannot download models.
+    phase2_embedding_backend: str = "sentence-transformers"
     phase2_embedding_batch_size: int = 32
     phase2_min_cluster_size: int = 3
     phase2_min_samples: int | None = None

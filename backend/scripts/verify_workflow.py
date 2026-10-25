@@ -6,17 +6,15 @@ Runs against a fresh SQLite database (never a real one):
 
 Steps: synthetic fixture -> mine -> approve -> analyze -> feedback -> evaluation.
 The default uses the configured Sentence Transformers model. When the model
-cannot be downloaded, `--stand-in-embedder` swaps in a deterministic
-bag-of-words embedder so the pipeline (HDBSCAN, persistence, routes) can still
-be exercised; that run does not verify embedding quality.
+cannot be downloaded, `--demo-fallback` sets PHASE2_EMBEDDING_BACKEND=demo-hashing,
+the app's labelled lexical fallback, so the pipeline (HDBSCAN, persistence,
+routes) can still be exercised; that run does not verify embedding quality.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
-import math
 import os
 import subprocess
 import sys
@@ -39,28 +37,6 @@ TARGET_PATCH = (
     "+# Use print statements instead of the logger here for now.\n"
     '+print("loaded accounts")\n'
 )
-
-
-class StandInEmbedder:
-    """Deterministic hashed bag-of-words vectors. Not a semantic model."""
-
-    dimensions = 256
-
-    def __init__(self, model_name: str) -> None:
-        self.model_name = model_name
-
-    def encode(self, texts, batch_size: int):
-        vectors = []
-        for text in texts:
-            vector = [0.0] * self.dimensions
-            for token in text.lower().split():
-                token = token.strip(".,!?()\"'")
-                if len(token) > 2:
-                    digest = hashlib.sha256(token.encode()).digest()
-                    vector[int.from_bytes(digest[:4], "big") % self.dimensions] += 1.0
-            norm = math.sqrt(sum(x * x for x in vector)) or 1.0
-            vectors.append([x / norm for x in vector])
-        return vectors
 
 
 async def create_fixture() -> tuple[int, int]:
@@ -164,20 +140,21 @@ def check(condition: bool, message: str) -> None:
         raise SystemExit(1)
 
 
-async def run(stand_in: bool) -> None:
+async def run() -> None:
     import httpx
 
-    from app.api.v1 import routes
     from app.main import app
-
-    if stand_in:
-        routes.SentenceTransformerEmbedder = StandInEmbedder
-    print(f"embedder: {'stand-in bag-of-words' if stand_in else 'Sentence Transformers'}")
     repository_id, target_id = await create_fixture()
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test/api/v1") as api:
+        config = (await api.get("/embedding/config")).json()
+        print(f"embedder: {config['model_name']} (fallback={config['fallback']})")
         mined = await api.post(f"/repositories/{repository_id}/mine?inline=true")
         check(mined.status_code == 202, f"mine -> {mined.status_code} {mined.text[:300]}")
+        check(
+            mined.json()["embedding_fallback"] == config["fallback"],
+            "mining reports the embedder it used",
+        )
         print("  mining:", {k: mined.json().get(k) for k in ("embedded", "clusters", "norms")})
 
         norms = (await api.get(f"/repositories/{repository_id}/candidate-norms")).json()
@@ -215,7 +192,7 @@ async def run(stand_in: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", required=True, help="path to a new SQLite file")
-    parser.add_argument("--stand-in-embedder", action="store_true")
+    parser.add_argument("--demo-fallback", action="store_true")
     args = parser.parse_args()
     database = Path(args.database).resolve()
     if database.exists():
@@ -223,14 +200,13 @@ def main() -> None:
     os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{database}"
     # HDBSCAN's default min_samples marks every point of an 8-comment fixture as noise.
     os.environ.setdefault("PHASE2_MIN_SAMPLES", "1")
-    if args.stand_in_embedder:
-        # Analysis looks up the embeddings mining stored under this model name.
-        os.environ["PHASE2_EMBEDDING_MODEL"] = "stand-in-bag-of-words"
+    if args.demo_fallback:
+        os.environ["PHASE2_EMBEDDING_BACKEND"] = "demo-hashing"
     backend = Path(__file__).resolve().parents[1]
     subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"], cwd=backend, check=True
     )
-    asyncio.run(run(args.stand_in_embedder))
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from app.models import (
     PullRequest,
     PullRequestAnalysis,
     PullRequestFile,
+    ReviewComment,
 )
 from app.services.phase2 import cosine_similarity
 
@@ -286,6 +287,29 @@ async def analyze_pull_request(
             )
         ).all()
     }
+    # Code that drew each review comment, so new code can be compared with
+    # code reviewers flagged, not only with the wording of their comments.
+    hunk_comments = [
+        comment
+        for comment in (
+            await db.scalars(
+                select(ReviewComment).where(
+                    ReviewComment.id.in_([item.review_comment_id for item in evidence_rows]),
+                    ReviewComment.diff_hunk.is_not(None),
+                )
+            )
+        ).all()
+        if comment.diff_hunk
+    ]
+    hunk_vectors: dict[int, Sequence[float]] = {}
+    if hunk_comments:
+        encoded = list(
+            embedder.encode(
+                [f"{item.path or ''}\n{item.diff_hunk}" for item in hunk_comments],
+                batch_size=batch_size,
+            )
+        )
+        hunk_vectors = {item.id: vector for item, vector in zip(hunk_comments, encoded)}
     findings: list[NormFinding] = []
     for file, context, vector in zip(
         [item for item in files if item.patch], contexts, vectors
@@ -300,9 +324,18 @@ async def analyze_pull_request(
             ]
             if not embeddings:
                 continue
-            relevance = max(
+            text_relevance = max(
                 cosine_similarity(vector, embedding.vector) for embedding in embeddings
             )
+            code_relevance = max(
+                (
+                    cosine_similarity(vector, hunk_vectors[comment_id])
+                    for comment_id in comment_ids
+                    if comment_id in hunk_vectors
+                ),
+                default=0.0,
+            )
+            relevance = max(text_relevance, code_relevance)
             if relevance < relevance_threshold:
                 continue
             evidence_strength = min(1.0, len(evidence) / 5)
@@ -319,8 +352,9 @@ async def analyze_pull_request(
                 0.45 * relevance + 0.35 * evidence_strength + 0.20 * norm.confidence,
             )
             explanation = (
-                f"Relevant approved norm matched with semantic relevance "
-                f"{relevance:.2f}; {len(evidence)} historical comment(s) support it. "
+                f"Relevant approved norm matched with relevance {relevance:.2f} "
+                f"(review-comment text {text_relevance:.2f}, previously reviewed code "
+                f"{code_relevance:.2f}); {len(evidence)} historical comment(s) support it. "
             )
             if suspected:
                 explanation += (

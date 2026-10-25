@@ -6,6 +6,8 @@ LOW_INFORMATION_PATTERNS = (
     r"^(hi|hello|hey|good morning|good afternoon)[!. ,]*$",
 )
 BOT_MARKERS = ("[bot]", "dependabot", "renovate", "github-actions")
+# A trailing "---" rule followed by one italic line, as tools append to comments.
+SIGNATURE_FOOTER = re.compile(r"\n\s*-{3,}\s*\n\s*_[^\n]*_\s*$")
 
 
 @dataclass(frozen=True)
@@ -20,7 +22,7 @@ def preprocess_comment(
     text: str | None, author_login: str | None = None
 ) -> ProcessedComment:
     raw = text or ""
-    normalized = re.sub(r"\s+", " ", raw).strip()
+    normalized = re.sub(r"\s+", " ", SIGNATURE_FOOTER.sub("", raw)).strip()
     folded = normalized.casefold()
     if not normalized:
         return ProcessedComment(raw, normalized, True, "empty")

@@ -8,7 +8,7 @@ from app.models import Repository
 from app.services.analysis import analyze_pull_request
 from app.services.auth import repository_token
 from app.services.ingestion import ingest_repository as run_ingestion
-from app.services.phase2 import SentenceTransformerEmbedder
+from app.services.phase2 import create_embedder
 from app.services.phase2 import mine_repository as run_phase2
 
 celery = Celery(
@@ -70,10 +70,7 @@ def analyze_pull_request_task(
 ):
     async def run():
         async with SessionLocal() as db:
-            settings = get_settings()
-            embedder = SentenceTransformerEmbedder(
-                model_name or settings.phase2_embedding_model
-            )
+            embedder = create_embedder(model_name)
             return await analyze_pull_request(db, pull_request_id, embedder=embedder)
 
     return _run(run)
