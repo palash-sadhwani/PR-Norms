@@ -29,6 +29,7 @@ from app.models import (
     Repository,
     Review,
     ReviewComment,
+    User,
 )
 from app.schemas.common import (
     FindingFeedbackIn,
@@ -429,6 +430,7 @@ async def pull_request_analysis(
     pr_numbers = await _pull_request_numbers(
         db, [comment.pull_request_id for comment in comments.values()]
     )
+    reviewer_logins = await _reviewer_logins(db, comments)
     norm_ids = {finding["candidate_norm_id"] for finding in payload}
     statements = dict(
         (
@@ -455,7 +457,9 @@ async def pull_request_analysis(
                 "evidence": [
                     {
                         "review_comment_id": comment_id,
-                        **_comment_detail(comments.get(comment_id), pr_numbers),
+                        **_comment_detail(
+                            comments.get(comment_id), pr_numbers, reviewer_logins
+                        ),
                     }
                     for comment_id in finding["evidence_comment_ids"]
                 ],
@@ -706,7 +710,11 @@ async def _pull_request_numbers(db: AsyncSession, ids: list[int]) -> dict[int, i
     return dict(rows.all())
 
 
-def _comment_detail(comment: ReviewComment | None, pr_numbers: dict[int, int]) -> dict:
+def _comment_detail(
+    comment: ReviewComment | None,
+    pr_numbers: dict[int, int],
+    reviewer_logins: dict[int, str] | None = None,
+) -> dict:
     if comment is None:
         return {"body": None}
     return {
@@ -716,7 +724,30 @@ def _comment_detail(comment: ReviewComment | None, pr_numbers: dict[int, int]) -
         "line": comment.line if comment.line is not None else comment.original_line,
         "outdated": comment.line is None and comment.original_line is not None,
         "pull_request_number": pr_numbers.get(comment.pull_request_id),
+        "reviewer_login": (reviewer_logins or {}).get(comment.id),
         "html_url": (comment.raw or {}).get("html_url"),
+    }
+
+
+async def _reviewer_logins(
+    db: AsyncSession, comments: dict[int, ReviewComment]
+) -> dict[int, str]:
+    author_ids = {comment.author_id for comment in comments.values() if comment.author_id}
+    logins = (
+        dict(
+            (
+                await db.execute(
+                    select(User.id, User.login).where(User.id.in_(author_ids))
+                )
+            ).all()
+        )
+        if author_ids
+        else {}
+    )
+    return {
+        comment.id: logins.get(comment.author_id)
+        or ((comment.raw or {}).get("user") or {}).get("login", "unknown")
+        for comment in comments.values()
     }
 
 
@@ -724,13 +755,16 @@ def _evidence_payload(
     evidence: list[CandidateNormEvidence],
     comments: dict[int, ReviewComment],
     pr_numbers: dict[int, int],
+    reviewer_logins: dict[int, str],
 ) -> list[dict]:
     return [
         {
             "review_comment_id": item.review_comment_id,
             "pull_request_id": item.pull_request_id,
             "active": item.active,
-            **_comment_detail(comments.get(item.review_comment_id), pr_numbers),
+            **_comment_detail(
+                comments.get(item.review_comment_id), pr_numbers, reviewer_logins
+            ),
         }
         for item in evidence
     ]
@@ -799,6 +833,7 @@ async def candidate_norms(repository_id: int, db: AsyncSession = Depends(get_db)
     pr_numbers = await _pull_request_numbers(
         db, [comment.pull_request_id for comment in comments.values()]
     )
+    reviewer_logins = await _reviewer_logins(db, comments)
     return [
         {
             "id": norm.id,
@@ -810,7 +845,9 @@ async def candidate_norms(repository_id: int, db: AsyncSession = Depends(get_db)
             "approved": norm.approved,
             "decision": norm.decision,
             "support_count": norm.support_count,
-            "evidence": _evidence_payload(evidence_by_norm[norm.id], comments, pr_numbers),
+            "evidence": _evidence_payload(
+                evidence_by_norm[norm.id], comments, pr_numbers, reviewer_logins
+            ),
         }
         for norm in norms
     ]
@@ -834,6 +871,7 @@ async def candidate_norm_detail(norm_id: int, db: AsyncSession = Depends(get_db)
     pr_numbers = await _pull_request_numbers(
         db, [comment.pull_request_id for comment in comments.values()]
     )
+    reviewer_logins = await _reviewer_logins(db, comments)
     history = list(
         (
             await db.scalars(
@@ -854,7 +892,7 @@ async def candidate_norm_detail(norm_id: int, db: AsyncSession = Depends(get_db)
         "approved": norm.approved,
         "decision": norm.decision,
         "support_count": norm.support_count,
-        "evidence": _evidence_payload(evidence, comments, pr_numbers),
+        "evidence": _evidence_payload(evidence, comments, pr_numbers, reviewer_logins),
         "history": [
             {
                 "version": item.version,

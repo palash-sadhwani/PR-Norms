@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from sqlalchemy import delete, func, select
@@ -24,8 +25,10 @@ from app.models import (
     PullRequest,
     Repository,
     ReviewComment,
+    User,
 )
 from app.services.norms import ensure_initial_version, record_version
+from app.services.preprocess import preprocess_comment
 
 # A new cluster continues a previous one when at least half of the smaller
 # cluster's comments are shared, or when their centroids nearly coincide.
@@ -36,6 +39,38 @@ DEMO_FALLBACK_MODEL = "demo-fallback/hashing-bag-of-words-v1"
 # Below this many comments HDBSCAN's default min_samples marks nearly
 # everything as noise, so a configured-unset min_samples drops to 1.
 SMALL_DATASET_COMMENTS = 50
+KEYWORD_STOPWORDS = frozenset(
+    {
+        "about",
+        "after",
+        "also",
+        "because",
+        "before",
+        "being",
+        "change",
+        "changes",
+        "code",
+        "consider",
+        "could",
+        "doing",
+        "file",
+        "here",
+        "into",
+        "just",
+        "keep",
+        "keeping",
+        "make",
+        "maybe",
+        "please",
+        "rather",
+        "should",
+        "that",
+        "this",
+        "use",
+        "using",
+        "would",
+    }
+)
 
 
 class Embedder(Protocol):
@@ -153,6 +188,15 @@ class MiningResult:
     embeddings_created: int = 0
     norms_created: int = 0
     norms_retired: int = 0
+    total_imported: int = 0
+    exclusion_reasons: dict[str, int] = field(default_factory=dict)
+    recovered_comments: int = 0
+    hdbscan_clusters: int = 0
+    rejected_clusters: int = 0
+    rejected_insufficient_evidence: int = 0
+    rejected_insufficient_pr_diversity: int = 0
+    candidate_norms_generated: int = 0
+    zero_norm_explanation: str | None = None
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
@@ -174,6 +218,91 @@ def _centroid(vectors: Sequence[Sequence[float]]) -> list[float]:
         sum(vector[index] for vector in vectors) / len(vectors)
         for index in range(dimensions)
     ]
+
+
+def _meaningful_keywords(text: str) -> frozenset[str]:
+    words = set()
+    for token in re.findall(r"[a-z0-9]+", text.casefold()):
+        if len(token) < 3 or token in KEYWORD_STOPWORDS:
+            continue
+        if token.endswith("ies") and len(token) > 4:
+            token = f"{token[:-3]}y"
+        elif token.endswith("s") and not token.endswith(("ss", "us")):
+            token = token[:-1]
+        words.add(token)
+    return frozenset(words)
+
+
+def _keyword_overlap(left: frozenset[str], right: frozenset[str]) -> float:
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+def _recover_noise_groups(
+    noise_indices: Sequence[int],
+    comments: Sequence[ReviewComment],
+    normalized_text: dict[int, str],
+    vectors: Sequence[Sequence[float]],
+    *,
+    min_cosine: float,
+    min_keyword_overlap: float,
+) -> list[list[int]]:
+    """Recover only complete-link groups; a weak bridge cannot chain topics."""
+    keywords = {
+        index: _meaningful_keywords(normalized_text[comments[index].id])
+        for index in noise_indices
+    }
+    keyword_indices: dict[str, list[int]] = {}
+    for index, terms in keywords.items():
+        for term in terms:
+            keyword_indices.setdefault(term, []).append(index)
+    possible_pairs = {
+        (left, right)
+        for indices in keyword_indices.values()
+        for offset, left in enumerate(indices)
+        for right in indices[offset + 1 :]
+    }
+
+    candidates: list[tuple[float, int, int]] = []
+    compatible_pairs: set[tuple[int, int]] = set()
+    for left, right in sorted(possible_pairs):
+        similarity = cosine_similarity(vectors[left], vectors[right])
+        if (
+            similarity >= min_cosine
+            and _keyword_overlap(keywords[left], keywords[right])
+            >= min_keyword_overlap
+        ):
+            compatible_pairs.add((left, right))
+            candidates.append((similarity, left, right))
+
+    candidates.sort(key=lambda candidate: (-candidate[0], candidate[1], candidate[2]))
+    groups = {index: {index} for index in noise_indices if keywords[index]}
+    group_for = {index: index for index in groups}
+    for _, left, right in candidates:
+        left_group = group_for[left]
+        right_group = group_for[right]
+        if left_group == right_group:
+            continue
+        left_members = groups[left_group]
+        right_members = groups[right_group]
+        if not all(
+            (min(first, second), max(first, second)) in compatible_pairs
+            for first in left_members
+            for second in right_members
+        ):
+            continue
+        merged = left_members | right_members
+        root = min(left_group, right_group)
+        discard = max(left_group, right_group)
+        groups[root] = merged
+        del groups[discard]
+        for index in merged:
+            group_for[index] = root
+
+    return sorted(
+        (sorted(members) for members in groups.values() if len(members) >= 2),
+        key=lambda members: members[0],
+    )
 
 
 async def mine_repository(
@@ -199,108 +328,147 @@ async def mine_repository(
                 .join(PullRequest, PullRequest.id == ReviewComment.pull_request_id)
                 .where(
                     PullRequest.repository_id == repository_id,
-                    ReviewComment.is_filtered.is_(False),
-                    ReviewComment.normalized_body.is_not(None),
-                    # Norms come from code-review comments, not general PR conversation.
-                    ReviewComment.id.not_in(select(IssueComment.id)),
                 )
                 .order_by(ReviewComment.id)
             )
         ).all()
     )
-    comments = [comment for comment in comments if comment.normalized_body]
-    total_comments = await db.scalar(
-        select(func.count(ReviewComment.id))
-        .join(PullRequest, PullRequest.id == ReviewComment.pull_request_id)
-        .where(PullRequest.repository_id == repository_id)
-    )
-    excluded = int(total_comments or 0) - len(comments)
-    if not comments:
-        return MiningResult(0, 0, 0, 0, eligible=0, excluded=excluded)
-
-    embedder = embedder or create_embedder(model_name)
-    # Store vectors under the name analysis will look them up by.
-    model_name = embedder.model_name
-    existing_embeddings = {
-        embedding.review_comment_id: embedding
-        for embedding in (
+    total_imported = len(comments)
+    issue_comment_ids = set(
+        (
             await db.scalars(
-                select(CommentEmbedding).where(
-                    CommentEmbedding.review_comment_id.in_(
-                        [comment.id for comment in comments]
-                    ),
-                    CommentEmbedding.model_name == model_name,
-                )
+                select(IssueComment.id)
+                .join(PullRequest, PullRequest.id == IssueComment.pull_request_id)
+                .where(PullRequest.repository_id == repository_id)
             )
         ).all()
-    }
-    hashes = {
-        comment.id: _hash_text(comment.normalized_body or "") for comment in comments
-    }
-    vectors_by_comment: dict[int, Sequence[float]] = {}
-    missing_comments = []
-    reused = 0
+    )
+    author_ids = {comment.author_id for comment in comments if comment.author_id}
+    author_logins = (
+        dict(
+            (
+                await db.execute(
+                    select(User.id, User.login).where(User.id.in_(author_ids))
+                )
+            ).all()
+        )
+        if author_ids
+        else {}
+    )
+    exclusion_reasons: Counter[str] = Counter()
+    eligible_comments: list[ReviewComment] = []
+    normalized_text: dict[int, str] = {}
     for comment in comments:
-        embedding = existing_embeddings.get(comment.id)
-        if (
-            embedding is not None
-            and embedding.source_text_hash == hashes[comment.id]
-            and embedding.vector
-        ):
-            vectors_by_comment[comment.id] = embedding.vector
-            reused += 1
+        reason = None
+        if comment.id in issue_comment_ids:
+            reason = "general_pr_conversation"
+        elif comment.is_filtered:
+            reason = comment.filter_reason or "filtered"
         else:
-            missing_comments.append(comment)
-    if missing_comments:
-        generated = embedder.encode(
-            [comment.normalized_body for comment in missing_comments],
-            batch_size=batch_size,
-        )
-        for comment, vector in zip(missing_comments, generated):
-            vectors_by_comment[comment.id] = vector
-    vectors = [vectors_by_comment[comment.id] for comment in comments]
-    if len(vectors) != len(comments):
-        raise ValueError("embedding provider returned an unexpected vector count")
-    dimensions = len(vectors[0])
-    if dimensions == 0 or any(len(vector) != dimensions for vector in vectors):
-        raise ValueError("embedding provider returned inconsistent vector dimensions")
-
-    for comment, vector in zip(comments, vectors):
-        embedding = existing_embeddings.get(comment.id)
-        if embedding is None:
-            embedding = CommentEmbedding(
-                review_comment_id=comment.id,
-                model_name=model_name,
+            processed = preprocess_comment(
+                comment.body, author_logins.get(comment.author_id)
             )
-            db.add(embedding)
-        embedding.source_text_hash = _hash_text(comment.normalized_body or "")
-        embedding.dimensions = len(vector)
-        embedding.vector = [float(value) for value in vector]
+            if processed.is_low_information:
+                reason = processed.reason or "low_information"
+            elif not comment.normalized_body:
+                reason = "missing_normalized_body"
+            elif not comment.path or not any(
+                (
+                    comment.line is not None,
+                    comment.original_line is not None,
+                    comment.start_line is not None,
+                    comment.position is not None,
+                    comment.diff_hunk,
+                )
+            ):
+                reason = "not_inline_review_comment"
+        if reason:
+            exclusion_reasons[reason] += 1
+            continue
+        eligible_comments.append(comment)
+        normalized_text[comment.id] = preprocess_comment(
+            comment.body, author_logins.get(comment.author_id)
+        ).normalized_text
 
-    if clusterer is None and len(vectors) < settings.phase2_min_cluster_size:
-        await db.commit()
-        return MiningResult(
-            len(comments),
-            0,
-            0,
-            0,
-            eligible=len(comments),
-            excluded=excluded,
-            embeddings_reused=reused,
-            embeddings_created=len(missing_comments),
-        )
+    comments = eligible_comments
+    excluded = total_imported - len(comments)
+    model_name = embedder.model_name if embedder else model_name
+    existing_embeddings: dict[int, CommentEmbedding] = {}
+    vectors_by_comment: dict[int, Sequence[float]] = {}
+    missing_comments: list[ReviewComment] = []
+    reused = 0
+    if comments:
+        embedder = embedder or create_embedder(model_name)
+        model_name = embedder.model_name
+        existing_embeddings = {
+            embedding.review_comment_id: embedding
+            for embedding in (
+                await db.scalars(
+                    select(CommentEmbedding).where(
+                        CommentEmbedding.review_comment_id.in_(
+                            [comment.id for comment in comments]
+                        ),
+                        CommentEmbedding.model_name == model_name,
+                    )
+                )
+            ).all()
+        }
+        hashes = {
+            comment.id: _hash_text(normalized_text[comment.id]) for comment in comments
+        }
+        for comment in comments:
+            embedding = existing_embeddings.get(comment.id)
+            if (
+                embedding is not None
+                and embedding.source_text_hash == hashes[comment.id]
+                and embedding.vector
+            ):
+                vectors_by_comment[comment.id] = embedding.vector
+                reused += 1
+            else:
+                missing_comments.append(comment)
+        if missing_comments:
+            generated = embedder.encode(
+                [normalized_text[comment.id] for comment in missing_comments],
+                batch_size=batch_size,
+            )
+            if len(generated) != len(missing_comments):
+                raise ValueError("embedding provider returned an unexpected vector count")
+            for comment, vector in zip(missing_comments, generated):
+                vectors_by_comment[comment.id] = vector
+        vectors = [vectors_by_comment[comment.id] for comment in comments]
+        dimensions = len(vectors[0])
+        if dimensions == 0 or any(len(vector) != dimensions for vector in vectors):
+            raise ValueError("embedding provider returned inconsistent vector dimensions")
+
+        for comment, vector in zip(comments, vectors):
+            embedding = existing_embeddings.get(comment.id)
+            if embedding is None:
+                embedding = CommentEmbedding(
+                    review_comment_id=comment.id,
+                    model_name=model_name,
+                )
+                db.add(embedding)
+            embedding.source_text_hash = _hash_text(normalized_text[comment.id])
+            embedding.dimensions = len(vector)
+            embedding.vector = [float(value) for value in vector]
+    else:
+        vectors = []
 
     min_samples = settings.phase2_min_samples
     if min_samples is None and len(vectors) < SMALL_DATASET_COMMENTS:
         min_samples = 1
-    clusterer = clusterer or HdbscanClusterer(
-        settings.phase2_min_cluster_size,
-        min_samples,
-        settings.phase2_random_seed,
-    )
-    labels = list(clusterer.fit_predict(vectors))
-    if len(labels) != len(comments):
-        raise ValueError("clusterer returned an unexpected label count")
+    if not vectors or (clusterer is None and len(vectors) < settings.phase2_min_cluster_size):
+        labels = [-1] * len(vectors)
+    else:
+        clusterer = clusterer or HdbscanClusterer(
+            settings.phase2_min_cluster_size,
+            min_samples,
+            settings.phase2_random_seed,
+        )
+        labels = list(clusterer.fit_predict(vectors))
+        if len(labels) != len(comments):
+            raise ValueError("clusterer returned an unexpected label count")
 
     previous_clusters = list(
         (
@@ -356,10 +524,56 @@ async def mine_repository(
         cluster.label = -cluster.id
     await db.flush()
 
-    grouped: dict[int, list[int]] = {}
+    hdbscan_grouped: dict[int, list[int]] = {}
     for index, label in enumerate(labels):
         if label >= 0:
-            grouped.setdefault(int(label), []).append(index)
+            hdbscan_grouped.setdefault(int(label), []).append(index)
+    hdbscan_clusters = len(hdbscan_grouped)
+    rejected_insufficient_evidence = 0
+    rejected_insufficient_pr_diversity = 0
+    accepted_groups: dict[int, list[int]] = {}
+    for label, indices in hdbscan_grouped.items():
+        if len(indices) < settings.phase2_min_support_comments:
+            rejected_insufficient_evidence += 1
+        elif len({comments[index].pull_request_id for index in indices}) < (
+            settings.phase2_min_support_pull_requests
+        ):
+            rejected_insufficient_pr_diversity += 1
+        else:
+            accepted_groups[label] = indices
+
+    noise_indices = [index for index, label in enumerate(labels) if label == -1]
+    recovery_candidates = _recover_noise_groups(
+        noise_indices,
+        comments,
+        normalized_text,
+        vectors,
+        min_cosine=settings.phase2_recovery_min_cosine,
+        min_keyword_overlap=settings.phase2_recovery_min_keyword_overlap,
+    )
+    recovered_groups = [
+        indices for indices in recovery_candidates if len(indices) >= 3
+    ]
+    rejected_insufficient_evidence += sum(
+        len(indices) < settings.phase2_min_support_comments
+        for indices in recovery_candidates
+    )
+    next_label = max(hdbscan_grouped, default=-1) + 1
+    recovered_comments = sum(len(indices) for indices in recovered_groups)
+    for indices in recovered_groups:
+        if len(indices) < settings.phase2_min_support_comments:
+            continue
+        if len({comments[index].pull_request_id for index in indices}) < (
+            settings.phase2_min_support_pull_requests
+        ):
+            rejected_insufficient_pr_diversity += 1
+        else:
+            accepted_groups[next_label] = indices
+        next_label += 1
+    rejected_clusters = (
+        rejected_insufficient_evidence + rejected_insufficient_pr_diversity
+    )
+    grouped = accepted_groups
     centers = {
         label: _centroid([vectors[index] for index in indices])
         for label, indices in grouped.items()
@@ -377,15 +591,18 @@ async def mine_repository(
 
     norm_count = 0
     norms_created = 0
-    noise = labels.count(-1)
+    noise = len(noise_indices) - recovered_comments
     for label, indices in sorted(grouped.items()):
         similarities = [
             cosine_similarity(vectors[index], centers[label]) for index in indices
         ]
-        confidence = min(
-            1.0,
-            (len(indices) / max(len(comments), 1)) * 0.5
-            + (sum(similarities) / len(similarities)) * 0.5,
+        distinct_pull_requests = len(
+            {comments[index].pull_request_id for index in indices}
+        )
+        confidence = (
+            0.6 * (sum(similarities) / len(similarities))
+            + 0.25 * min(len(indices) / 6, 1.0)
+            + 0.15 * min(distinct_pull_requests / 3, 1.0)
         )
         cluster = clusters_by_id.get(matches.get(label, -1))
         if cluster is None:
@@ -403,13 +620,19 @@ async def mine_repository(
         cluster.active = True
         cluster.algorithm_config = {
             "min_cluster_size": settings.phase2_min_cluster_size,
-            "min_samples": settings.phase2_min_samples,
+            "min_samples": min_samples,
             "random_seed": settings.phase2_random_seed,
+            "min_support_comments": settings.phase2_min_support_comments,
+            "min_support_pull_requests": settings.phase2_min_support_pull_requests,
+            "recovery_min_cosine": settings.phase2_recovery_min_cosine,
+            "recovery_min_keyword_overlap": settings.phase2_recovery_min_keyword_overlap,
+            "recovered_from_noise": label not in hdbscan_grouped,
         }
         cluster.size = len(indices)
         cluster.confidence = confidence
         await db.flush()
-        representative = comments[indices[similarities.index(max(similarities))]]
+        representative_index = indices[similarities.index(max(similarities))]
+        representative = normalized_text[comments[representative_index].id]
         norm = await db.scalar(
             select(CandidateNorm).where(CandidateNorm.cluster_id == cluster.id)
         )
@@ -418,7 +641,7 @@ async def mine_repository(
             norm = CandidateNorm(
                 repository_id=repository_id,
                 cluster_id=cluster.id,
-                statement=representative.normalized_body or "",
+                statement=representative,
                 confidence=confidence,
                 support_count=len(indices),
             )
@@ -440,7 +663,7 @@ async def mine_repository(
         if not created:
             if not await _has_history(db, norm.id):
                 # Untouched machine candidate: keep it describing its cluster.
-                norm.statement = representative.normalized_body or norm.statement
+                norm.statement = representative or norm.statement
                 norm.confidence = confidence
             elif added or removed:
                 await record_version(
@@ -470,6 +693,7 @@ async def mine_repository(
         await _sync_evidence(db, norm, [])
         if norm.status in {"emerging", "active"}:
             norm.status = "weakening"
+            norm.support_count = 0
         await record_version(
             db,
             norm,
@@ -479,9 +703,27 @@ async def mine_repository(
         norms_retired += 1
 
     await db.commit()
+    if norm_count:
+        zero_norm_explanation = None
+    elif not comments:
+        zero_norm_explanation = "No eligible inline review comments were found."
+    elif len(comments) < settings.phase2_min_support_comments:
+        zero_norm_explanation = (
+            "Not enough comments exist to satisfy the minimum support requirement."
+        )
+    elif rejected_insufficient_pr_diversity:
+        zero_norm_explanation = (
+            "Clusters did not have evidence across enough distinct pull requests."
+        )
+    elif rejected_insufficient_evidence:
+        zero_norm_explanation = "Clusters did not meet the minimum comment support."
+    else:
+        zero_norm_explanation = (
+            "Comments were too dissimilar to form meaningful clusters."
+        )
     return MiningResult(
         len(comments),
-        len(comments) - noise,
+        sum(len(indices) for indices in grouped.values()),
         len(grouped),
         norm_count,
         eligible=len(comments),
@@ -491,6 +733,15 @@ async def mine_repository(
         embeddings_created=len(missing_comments),
         norms_created=norms_created,
         norms_retired=norms_retired,
+        total_imported=total_imported,
+        exclusion_reasons=dict(exclusion_reasons),
+        recovered_comments=recovered_comments,
+        hdbscan_clusters=hdbscan_clusters,
+        rejected_clusters=rejected_clusters,
+        rejected_insufficient_evidence=rejected_insufficient_evidence,
+        rejected_insufficient_pr_diversity=rejected_insufficient_pr_diversity,
+        candidate_norms_generated=norm_count,
+        zero_norm_explanation=zero_norm_explanation,
     )
 
 

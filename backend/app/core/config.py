@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     phase2_min_cluster_size: int = 3
     phase2_min_samples: int | None = None
     phase2_random_seed: int = 42
+    phase2_min_support_comments: int = Field(default=3, gt=0)
+    phase2_min_support_pull_requests: int = Field(default=2, gt=0)
+    phase2_recovery_min_cosine: float = Field(default=0.70, ge=0.0, le=1.0)
+    phase2_recovery_min_keyword_overlap: float = Field(
+        default=0.15, ge=0.0, le=1.0
+    )
     public_import_max_pull_requests: int = 1000
     model_config = SettingsConfigDict(
         env_file=".env",
