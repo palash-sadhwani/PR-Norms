@@ -35,10 +35,19 @@ Docker alternative: `cp .env.example .env && docker compose up --build`.
 | `GITHUB_TOKEN` | Optional, backend only. Raises the GitHub rate limit from 60 to 5,000 requests/hour. Placeholder: `ghp_your_token_here`. Never commit it. |
 | `PHASE2_EMBEDDING_BACKEND` | `sentence-transformers` (default, the real model) or `demo-hashing` (labelled lexical fallback for machines that cannot download the model). |
 | `PHASE2_MIN_CLUSTER_SIZE` | Minimum comments per norm (default 3). |
+| `PHASE2_MIN_SUPPORT_COMMENTS` | Minimum eligible inline review comments for a norm (default 3). |
+| `PHASE2_MIN_SUPPORT_PULL_REQUESTS` | Distinct pull requests required per norm (default 2). |
+| `PHASE2_RECOVERY_MIN_COSINE` | HDBSCAN-noise recovery cosine threshold (default 0.70). |
+| `PHASE2_RECOVERY_MIN_KEYWORD_OVERLAP` | Meaningful-keyword Jaccard threshold for noise recovery (default 0.15). |
 
 When `demo-hashing` is active the UI shows a red banner, and mining and analysis
 responses report `embedding_fallback: true`. Fallback vectors are stored under
 their own model name and never mix with real-model results.
+
+Mining uses only meaningful inline review comments, not general PR conversation.
+HDBSCAN noise is recovered only into cohesive groups that meet the comment and
+cross-PR evidence requirements; the dashboard explains exclusions and rejected
+clusters when no candidate norm is produced.
 
 ## 2. Connect a public repository
 

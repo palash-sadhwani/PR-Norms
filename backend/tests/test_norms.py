@@ -74,6 +74,8 @@ async def _fixture(db):
         github_id=10,
         body="Use the repository layer.",
         normalized_body="Use the repository layer.",
+        path="app/data.py",
+        line=5,
         is_filtered=False,
     )
     db.add(comment)
@@ -144,7 +146,40 @@ async def test_norm_lifecycle_preserves_versions_and_evidence():
 async def test_phase2_refresh_keeps_norm_history():
     engine, factory = await _database()
     async with factory() as db:
-        repository, _, norm = await _fixture(db)
+        repository, first_pr, norm = await _fixture(db)
+        comments = [
+            ReviewComment(
+                pull_request_id=first_pr.id,
+                github_id=11,
+                body="Keep database calls in the repository layer.",
+                normalized_body="Keep database calls in the repository layer.",
+                path="app/data.py",
+                line=12,
+                is_filtered=False,
+            )
+        ]
+        second_pr = PullRequest(
+            repository_id=repository.id,
+            github_id=4,
+            number=2,
+            title="Another review",
+            state="open",
+        )
+        db.add(second_pr)
+        await db.flush()
+        comments.append(
+            ReviewComment(
+                pull_request_id=second_pr.id,
+                github_id=12,
+                body="Database access belongs in the repository layer.",
+                normalized_body="Database access belongs in the repository layer.",
+                path="app/data.py",
+                line=18,
+                is_filtered=False,
+            )
+        )
+        db.add_all(comments)
+        await db.commit()
         await approve_norm(db, norm.id, changed_by="maintainer", reason="approved")
 
         class Embedder:
@@ -155,7 +190,7 @@ async def test_phase2_refresh_keeps_norm_history():
 
         class Clusterer:
             def fit_predict(self, vectors):
-                return [1]
+                return [1] * len(vectors)
 
         await mine_repository(
             db,
@@ -166,7 +201,8 @@ async def test_phase2_refresh_keeps_norm_history():
             batch_size=1,
         )
         versions = list((await db.scalars(select(NormVersion))).all())
-        assert len(versions) == 2
+        assert len(versions) == 3
+        assert versions[-1].evidence_count == 3
         assert await db.get(CandidateNorm, norm.id) is not None
 
     await engine.dispose()

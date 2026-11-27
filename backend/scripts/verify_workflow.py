@@ -31,10 +31,14 @@ HISTORICAL_COMMENTS = [
     ("app/api/orders.py", "Please use the logger instead of print statements."),
     ("app/api/billing.py", "Replace print statements with the logger please."),
     ("app/api/users.py", "Use the logger, not print statements, in this module."),
+    ("app/api/inputs.py", "Validate request input before processing the request."),
+    ("app/api/payloads.py", "Check user input before processing the payload."),
+    ("app/api/forms.py", "Validate incoming data before handling the request."),
+    ("app/api/requests.py", "Check request data before processing user input."),
 ]
 TARGET_PATCH = (
     "@@ -1,2 +1,4 @@\n import os\n"
-    "+# Use print statements instead of the logger here for now.\n"
+    "+# Use the logger instead of print statements here.\n"
     '+print("loaded accounts")\n'
 )
 
@@ -158,7 +162,7 @@ async def run() -> None:
         print("  mining:", {k: mined.json().get(k) for k in ("embedded", "clusters", "norms")})
 
         norms = (await api.get(f"/repositories/{repository_id}/candidate-norms")).json()
-        check(len(norms) > 0, f"candidate norms mined: {len(norms)}")
+        check(len(norms) >= 2, f"recurring themes mined: {len(norms)} candidate norms")
         for norm in norms:
             print(f"  norm {norm['id']}: {norm['statement']!r} support={norm['support_count']}")
             approved = await api.post(

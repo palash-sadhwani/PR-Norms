@@ -104,8 +104,17 @@ GET  /api/v1/repositories/{repository_id}/candidate-norms
 Phase 2 uses the configured Sentence Transformers model and HDBSCAN. The
 default model is `sentence-transformers/all-MiniLM-L6-v2`; set
 `PHASE2_EMBEDDING_MODEL`, `PHASE2_MIN_CLUSTER_SIZE`, and
-`PHASE2_MIN_SAMPLES` to tune local runs. Original comment text remains in the
-Phase 1 records, while candidate norms retain comment and pull-request evidence.
+`PHASE2_MIN_SAMPLES` to tune local runs. Norm candidates require at least three
+meaningful inline review comments across at least two pull requests by default
+(`PHASE2_MIN_SUPPORT_COMMENTS` and
+`PHASE2_MIN_SUPPORT_PULL_REQUESTS`). HDBSCAN remains the primary clusterer;
+noise recovery additionally requires cosine similarity of at least `0.70` and
+meaningful-keyword Jaccard overlap of at least `0.15` by default. These recovery
+thresholds can be set with `PHASE2_RECOVERY_MIN_COSINE` and
+`PHASE2_RECOVERY_MIN_KEYWORD_OVERLAP`. Original comment text remains in the
+Phase 1 records, while candidate norms retain comment, reviewer, and
+pull-request evidence. The inline mining response reports exclusions, recovered
+noise, rejected clusters, and a reason when no candidate norm is generated.
 
 Phase 4 analyzes an imported pull request without writing to GitHub:
 
